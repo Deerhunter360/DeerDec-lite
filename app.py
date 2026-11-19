@@ -44,6 +44,8 @@ class MainWindow(QMainWindow):
         self.records, self.current_rec = [], None
         self.pending, self.busy_until = [], 0.0       # alerts waiting their turn / when the current one ends
         self.screen_win = self._make_screen()
+        self.details_win = None
+        QTimer.singleShot(800, self._apply_details)
         self.listener = None
         if self.engine.monitor:
             self.engine.monitor.busy_cb = self._hold_live
@@ -61,6 +63,8 @@ class MainWindow(QMainWindow):
         self.watchdog_timer.timeout.connect(self.engine.supervise)
         self.watchdog_timer.start(5000)
 
+        cgen.EXTRA_TEXT = self._borrowed_text
+        cgen.MAP_SHAPES = self._borrowed_shapes
         tabs = QTabWidget()
         tabs.addTab(self._monitor_tab(), "Monitor")
         QShortcut(QKeySequence("Ctrl+Shift+A"), self, activated=self._abort_alert)
@@ -176,20 +180,57 @@ class MainWindow(QMainWindow):
         self.cfg.cgen_style = self.style_cb.currentData()
         self.cfg.save()
         self._rebuild_screen()
+        self._apply_details()
 
     def _screen_changed(self):
         self.cfg.cgen_screen = self.screen_cb.currentData()
         self.cfg.save()
         cgen.configure(self.cfg)
+        self._apply_details()
         if self.screen_win.isVisible() and self.current_rec:
             self._show(self.current_rec)
 
     def _switch_from_key(self, style):
         self.style_cb.setCurrentIndex(max(0, self.style_cb.findData(style)))
 
+    def _borrowed_shapes(self, rec):
+        """Polygon rings the engine borrowed from the matching NWS / CAP alert (heard alerts, or CAP without one)."""
+        a, e = rec.alert, self.engine
+        got = getattr(e, "_heard_poly", {}).get(getattr(a, "id", ""))
+        if not got and getattr(a, "cap_id", ""):
+            try:
+                got = e._nws_cache().get(a.cap_id)
+            except Exception:
+                got = None
+        return got or []
+
+    def _borrowed_text(self, rec):
+        """Message text the engine borrowed from the matching NWS / CAP alert (for screens that show a message)."""
+        info = (getattr(self.engine, "_outline_info", {}) or {}).get(getattr(rec.alert, "id", "")) or {}
+        return " ".join(x.strip() for x in (info.get("description", ""), info.get("instruction", "")) if x and x.strip())
+
+    def _details_texts(self):
+        return {"easyplus": self.cfg.details_text, "dasdec": self.cfg.details_text_dasdec,
+                "vds": self.cfg.details_text_vds}
+
+    def _apply_details(self):
+        """Show / hide / refresh the standby 'EAS DETAILS CHANNEL' screen."""
+        if getattr(self.cfg, "details_channel", False):
+            if self.details_win is None:
+                self.details_win = cgen.DetailsScreen(self._details_texts(), self.cfg.cgen_style)
+            self.details_win.texts = self._details_texts()
+            self.details_win.style = cgen.ALIASES.get(self.cfg.cgen_style, self.cfg.cgen_style)
+            cgen.place_on_screen(self.details_win)
+            self.details_win.update()
+            if self.screen_win.isVisible():
+                self.screen_win.raise_()
+        elif self.details_win is not None:
+            self.details_win.hide()
+
     def _show(self, rec, dur=None):
         self.current_rec = rec
         self.screen_win.show_record(rec, dur or max(self.cfg.cgen_seconds, int(rec.seconds) + 2))
+
 
 
 
@@ -453,6 +494,16 @@ class MainWindow(QMainWindow):
             ("auto_cgen", "bool", "Show the alert screen automatically", None, ""),
             ("cgen_seconds", "int", "Minimum time on screen (seconds)", (5, 900), ""),
             ("cgen_page_seconds", "float", "Seconds per page (paged screens)", (2.0, 60.0), ""),
+            ("laptop_only", "bool", "LAPTOP ONLY (show in a window, not full screen)", None,
+             "For a single screen: the alert screen and Details Channel open as normal resizable windows. "
+             "Turn it off for the real full-screen setup."),
+            ("details_channel", "bool", "EAS Details Channel standby screen", None,
+             "Keeps a black 'EAS DETAILS CHANNEL' screen up full-screen on the chosen monitor; alerts show over it. "
+             "It covers that monitor, so use it with a second monitor or a video output."),
+            ("details_text", "text", "Details channel text (EASyPLUS)", None, ""),
+            ("details_text_dasdec", "text", "Details channel text (DASDEC)", None, "The name shown across the top."),
+            ("details_text_vds", "text", "Details channel text (VDS)", None, "The second line under EMERGENCY ALERT SYSTEM."),
+            ("bulletin_station", "text", "Weather Bulletin station", None, "Call letters then channel, e.g. KDEER 12 (a made-up station)."),
             ("classic_scale", "float", "EASyPLUS text size", (0.5, 2.0), "1.0 = default."),
             ("atari_scale", "float", "Atari 800XL text size", (0.3, 1.6), "1.0 = default."),
             ("cgen_font", "text", "EASyPLUS fallback font", None, "Used only when fonts/eas.ttf is missing."),
@@ -657,6 +708,7 @@ class MainWindow(QMainWindow):
                 first["target"] = c.feed_url                # the Config "Feed URL" is the main (first) IPAWS feed
             c.save()
             cgen.configure(c)
+            self._apply_details()
             self._rebuild_screen()
             self._log("Config saved")
             self.cfg_status.setText("Saved")
@@ -695,6 +747,8 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self.engine.stop()
+        if self.details_win is not None:
+            self.details_win.close()
         try:
             self.map_server.stop()
         except Exception:

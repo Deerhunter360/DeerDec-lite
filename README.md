@@ -18,7 +18,7 @@ on a full-screen CGEN. There is also a live alert map. Hobby / online use only.
 
 ## Setup (Windows)
     setup.bat                      # or: pip install -r requirements.txt
-    python app.py                  # or double-click DeerDec.bat
+    python app.py                  # or double-click DeerDec.vbs
 
 Python 3.10+. The map needs internet for tiles and (once) county outlines. Fonts go in `fonts/` (optional):
 `eas.ttf` (EASyPLUS), `luximr/luximb/luximri/luximbi.ttf` (DASDEC-II), `atari.ttf` (Atari 800XL).

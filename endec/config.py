@@ -54,7 +54,13 @@ class Config:
     cgen_seconds: int = 60
     cgen_style: str = "dasdec"         # see cgen.STYLES
     cgen_screen: int = -1              # monitor index (-1 = default)
+    laptop_only: bool = False          # LAPTOP ONLY: alert + details screens in a window, not full screen
+    bulletin_station: str = "KDEER 12"   # Weather Bulletin style: call letters + channel number
     cgen_page_seconds: float = 8.0
+    details_channel: bool = False      # idle "EAS DETAILS CHANNEL" screen, full screen, with alerts shown over it
+    details_text: str = "EAS DETAILS CHANNEL"            # EASyPLUS standby text
+    details_text_dasdec: str = "DEERDEC Details Channel"  # DASDEC standby text (the unit shows its own name here)
+    details_text_vds: str = "DETAILS CHANNEL"            # VDS standby second line
     cgen_font: str = "EAS OSD Mono"
     classic_scale: float = 1.0
     atari_scale: float = 1.0           # Atari 800XL text size multiplier
