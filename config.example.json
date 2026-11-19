@@ -1,0 +1,35 @@
+{
+  "feed_url": "https://apps.fema.gov/IPAWSOPEN_EAS_SERVICE/rest/feed",
+  "poll_seconds": 60,
+  "watch_fips": [],
+  "only_actual": true,
+  "skip_backlog": true,
+  "callsign": "DEERDEC",
+  "attn_seconds": 8,
+  "out_dir": "alerts",
+  "easdata_path": "EASData.json",
+  "sources": [
+    {
+      "name": "IPAWS CAP feed",
+      "kind": "ipaws",
+      "enabled": true,
+      "target": "https://apps.fema.gov/IPAWSOPEN_EAS_SERVICE/rest/feed"
+    }
+  ],
+  "active_source": "IPAWS CAP feed",
+  "ffmpeg_path": "ffmpeg",
+  "auto_start": true,
+  "boot_screen": true,
+  "auto_cgen": true,
+  "auto_play": false,
+  "cgen_seconds": 60,
+  "cgen_style": "dasdec",
+  "cgen_screen": -1,
+  "cgen_page_seconds": 8.0,
+  "cgen_font": "EAS OSD Mono",
+  "classic_scale": 1.0,
+  "tts_enabled": true,
+  "tts_rate": 165,
+  "tts_voice": "",
+  "tts_include_description": true
+}
