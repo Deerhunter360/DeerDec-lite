@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """DeerDec - EAS encoder / decoder / CGEN.   Run:  python app.py   (pip install -r requirements.txt)"""
+import os
 import queue
 import re
 import sys
@@ -45,7 +46,7 @@ class MainWindow(QMainWindow):
         self.screen_win = self._make_screen()
         self.listener = None
         if self.engine.monitor:
-            self.engine.monitor.busy_cb = self._busy
+            self.engine.monitor.busy_cb = self._hold_live
         if self.engine.monitor:
             try:
                 from endec.listen import AudioListener
@@ -211,6 +212,13 @@ class MainWindow(QMainWindow):
     def _busy(self):
         return time.time() < self.busy_until
 
+    def _hold_live(self):
+        """True when a newly heard alert must NOT be relayed live: something is already on air, queued,
+        being built, or being relayed live.  It is recorded instead and plays, tones and all, in its turn."""
+        m = self.engine.monitor
+        return bool(self._busy() or self.pending or self.engine.building
+                    or (m is not None and m.relay_source is not None))
+
     def _dispatch(self):
         if self._busy():
             return
@@ -366,6 +374,12 @@ class MainWindow(QMainWindow):
         self._log(rec.text)
         if self._busy() or any(r for r in self.pending):
             self._log(f"Another alert is on air - {rec.title} queued ({len(self.pending) + 1} waiting)")
+            if rec.from_audio and rec.mode == "live":
+                # This one was set to relay live but has to wait, so there is nothing live to join later.
+                # Play its recording (header, attention tone, message, EOM) when its turn comes.
+                rec.mode = "record"
+                rec.ready = os.path.basename(rec.wav or "").startswith("heard_")      # True once the recording is finished
+                self._log(f"{rec.title}: will play from its recording when it is next")
         self.pending.append(rec)
         self._dispatch()
 

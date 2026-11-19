@@ -81,6 +81,8 @@ class Endec:
         self.alert_log = self._load_log()
         self._map_cache = {}                         # feed link -> full Alert
         self._zone_geo = None
+        self._outline_info = {}                     # alert id -> text borrowed from the matching NWS / CAP alert
+        self._outline_tried = set()                 # CAP alerts already being searched for an outline
         self._heard_poly = {}                        # heard-alert id -> polygon rings borrowed from NWS
         self._nws_geo = None
         self._map_src = {}                           # raw header -> (Alert, source name) heard on audio
@@ -155,6 +157,7 @@ class Endec:
                 del fails[link]
         self._resolve_zones()
         self._resolve_nws()
+        self._start_cap_outlines()
         polled = {getattr(c, "feed_name", "IPAWS") for c in clients}
         for link in list(self._map_cache):                         # gone from a feed that answered = gone
             if link not in owner and self._map_feed.get(link, "IPAWS") in polled:
@@ -175,8 +178,8 @@ class Endec:
         "50": "VT", "51": "VA", "53": "WA", "54": "WV", "55": "WI", "56": "WY", "60": "AS", "66": "GU", "69": "MP",
         "72": "PR", "78": "VI"}
 
-    def _heard_lookup(self, raw, hdr):
-        """An NWR alert heard on a stream: find the same alert on api.weather.gov and borrow its polygon
+    def _heard_lookup(self, raw, hdr, key=None, alive=None):
+        """An NWR alert heard on a stream (or a CAP alert that came without a polygon): find the same alert on api.weather.gov and borrow its polygon
         (or the outlines of its zones). Only improves the map shape - it never creates an alert."""
         areas = set()
         for c in hdr.fips:
@@ -189,30 +192,69 @@ class Endec:
         if not areas or len(areas) > 6:
             return
         fips = {str(c).zfill(6) for c in hdr.fips}
-        for wait in (0, 20, 30, 45, 90, 120):                  # NWS can take a little while to list it
-            if raw not in self._map_src or self._stop.is_set():
+        key = key or f"audio-{raw}"
+        where = "heard on the stream" if key.startswith("audio-") else "from the CAP feed"
+        alive = alive or (lambda: raw in self._map_src)
+        why = "no attempt"
+        try:                                                   # keep looking until the alert ends (max 3 h)
+            deadline = hdr.issued + timedelta(hours=int(hdr.purge[:2]), minutes=int(hdr.purge[2:]))
+        except Exception:
+            deadline = hdr.issued + timedelta(hours=1)
+        deadline = min(deadline, datetime.now(timezone.utc) + timedelta(hours=3))
+        waits = [0, 20, 30, 45, 90, 120]
+        n = -1
+        while True:
+            n += 1
+            wait = waits[n] if n < len(waits) else 60          # NWS / IPAWS can take minutes to list it
+            if self._stop.wait(wait) or not alive() or datetime.now(timezone.utc) > deadline:
+                break
+            # 1) an IPAWS / CAP alert for the same thing may have arrived since - borrow its polygon
+            twin = self._cap_twin(hdr)
+            if twin:
+                self._heard_poly[key] = twin.polygons
+                self._outline_info[key] = {"headline": twin.headline, "description": twin.description,
+                                           "instruction": twin.instruction, "severity": twin.severity,
+                                           "from": "the CAP feed"}
+                self.log(f"Map: found the outline and text for the {hdr.eee} {where} in the CAP feed ({len(twin.polygons)} shape(s))")
+                self._rebuild_map()
                 return
-            time.sleep(wait)
             try:
                 feats = self._nws_get("https://api.weather.gov/alerts/active?area=" + ",".join(sorted(areas))).get("features", [])
-            except Exception:
+            except Exception as e:
+                why = f"could not reach the NWS alerts API ({e})"
                 continue
-            best, best_score = None, 0
+            cands, same_event, seen = [], 0, {}
             for f in feats:
                 pr = f.get("properties", {})
+                for code in (pr.get("eventCode", {}).get("SAME") or ["?"]):
+                    seen[code] = seen.get(code, 0) + 1
                 if hdr.eee not in (pr.get("eventCode", {}).get("SAME") or []):
                     continue
+                same_event += 1
                 same = {str(x).zfill(6) for x in (pr.get("geocode", {}).get("SAME") or [])}
                 overlap = len(same & fips)
                 if not overlap:
                     continue
                 t = self._parse_time(pr.get("sent") or pr.get("effective"))
-                if t and abs((t - hdr.issued).total_seconds()) > 15 * 60:
-                    continue
-                if overlap > best_score:
-                    best, best_score = f, overlap
+                gap = abs((t - hdr.issued).total_seconds()) if t else 0
+                cands.append((gap > 30 * 60, -overlap, gap, f))
+            why = (f"{len(feats)} active NWS alert(s) in {','.join(sorted(areas))}, {same_event} {hdr.eee}, "
+                   f"{len(cands)} covering the same area"
+                   + ("" if same_event or not seen else " [NWS lists: " + ", ".join(f"{k} {v}" for k, v in sorted(seen.items(), key=lambda x: -x[1])[:8]) + "]"))
+            if n == 0:
+                self.log(f"Map: looking for the NWS outline of the {hdr.eee} {where} - {why} "
+                         "(will keep checking NWS and the CAP feeds until it shows up)")
+            elif n % 5 == 0:
+                self.log(f"Map: still waiting for the {hdr.eee} outline ({why})")
+            cands.sort(key=lambda c: c[:3])
+            best = cands[0][3] if cands and not cands[0][0] else None
             if not best:
                 continue
+            pr = best.get("properties", {})
+            self._outline_info[key] = {"headline": pr.get("headline") or "", "description": pr.get("description") or "",
+                                       "instruction": pr.get("instruction") or "", "severity": pr.get("severity") or "",
+                                       "from": "the National Weather Service"}
+            self._rebuild_map()                                 # the text can show even before the shape is found
             rings = self._rings(best.get("geometry"))
             if not rings:
                 try:
@@ -221,10 +263,49 @@ class Endec:
                 except Exception:
                     pass
             if rings:
-                self._heard_poly[f"audio-{raw}"] = rings
-                self.log(f"Map: found the NWS outline for the {hdr.eee} heard on the stream ({len(rings)} shape(s))")
+                self._heard_poly[key] = rings
+                self.log(f"Map: found the NWS outline for the {hdr.eee} {where} ({len(rings)} shape(s))")
                 self._rebuild_map()
                 return
+            why = "found the alert but NWS has no polygon or zone shapes for it"
+        if alive():
+            self.log(f"Map: no outline for the {hdr.eee} {where} ({why}) - shown by county")
+
+    def _start_cap_outlines(self):
+        """A CAP alert that arrived with no polygon (and isn't an NWS alert we can look up by id) gets the same
+        patient search as a heard alert: NWS first, other CAP feeds too, retrying until it shows up."""
+        now = datetime.now(timezone.utc)
+        sup = self._superseded(self._map_cache.values())
+        for a in list(self._map_cache.values()):
+            if (a.polygons or not a.fips or a.id in self._outline_tried or a.id in self._heard_poly
+                    or (a.cap_id or "").startswith("urn:oid:2.49.0.1.840.0")
+                    or a.eee in self.TEST_CODES or not self._map_eligible(a, now, sup)):
+                continue
+            if len(self._outline_tried) > 500:
+                self._outline_tried.clear()
+            self._outline_tried.add(a.id)
+            try:
+                hdr = SameHeader.from_alert(a, self.cfg.callsign)
+                hdr.issued = self._parse_time(a.sent) or hdr.issued
+            except Exception:
+                continue
+            ids = a.id
+            alive = lambda ids=ids: any(x.id == ids for x in list(self._map_cache.values()))
+            threading.Thread(target=self._heard_lookup, args=(a.id, hdr, a.id, alive), daemon=True).start()
+
+    def _cap_twin(self, hdr):
+        """Polygon rings of a CAP alert (any feed) with the same event covering the same counties, if there is one."""
+        fips = {str(c).zfill(6) for c in hdr.fips}
+        for a in list(self._map_cache.values()):
+            if a.eee != hdr.eee or not a.polygons:
+                continue
+            if not ({str(c).zfill(6) for c in a.fips} & fips):
+                continue
+            t = self._parse_time(a.sent)
+            if t and abs((t - hdr.issued).total_seconds()) > 20 * 60:
+                continue                                   # a different warning for the same area
+            return a
+        return None
 
     def _ugcs(self, a):
         """NWS zone codes for an alert: the ones in its CAP plus any marine area derived from its SAME codes."""
@@ -336,11 +417,20 @@ class Endec:
                 out.append(ring[::max(1, len(ring) // 500)])
         return out
 
-    @staticmethod
-    def _nws_get(url):
+    _nws_cache_t = {}                                       # url -> (time, data): many alerts ask for the same list
+
+    @classmethod
+    def _nws_get(cls, url):
+        hit = cls._nws_cache_t.get(url)
+        if hit and time.time() - hit[0] < 45:
+            return hit[1]
         req = urllib.request.Request(url, headers={"User-Agent": "DeerDec/1.0", "Accept": "application/geo+json"})
         with urllib.request.urlopen(req, timeout=20) as r:
-            return json.loads(r.read())
+            data = json.loads(r.read())
+        if len(cls._nws_cache_t) > 60:
+            cls._nws_cache_t.clear()
+        cls._nws_cache_t[url] = (time.time(), data)
+        return data
 
     def _resolve_nws(self):
         now = datetime.now(timezone.utc)
@@ -398,14 +488,16 @@ class Endec:
             if a.id in sources and (a.eee, frozenset(a.fips)) in ipaws_keys:
                 continue                                    # IPAWS already has this one, with more detail
             zones = [ring for u in self._ugcs(a) for ring in self._zone_cache().get(u, [])]
-            polys = a.polygons or (self._nws_cache().get(a.cap_id, []) if a.cap_id else self._heard_poly.get(a.id, []))
+            polys = a.polygons or (self._nws_cache().get(a.cap_id) if a.cap_id else None) or self._heard_poly.get(a.id, [])
             title, color, _img, _n = easdata.resolve(a.eee, a.event)
+            info = self._outline_info.get(a.id) or {}
             out.append({
                 "zones": zones,
                 "id": a.id, "eee": a.eee, "title": title, "level": EasData.level(color),
                 "sender": a.sender_name or a.sender, "area": a.area, "fips": a.fips,
-                "polygons": polys, "headline": a.headline, "description": a.description,
-                "instruction": a.instruction, "severity": a.severity,
+                "polygons": polys, "headline": info.get("headline") or a.headline,
+                "description": self._with_note(a, info, a.id in sources),
+                "instruction": a.instruction or info.get("instruction", ""), "severity": a.severity or info.get("severity", ""),
                 "sent": self._fmt_time(a.sent), "expires": self._fmt_time(a.expires),
                 "origin": ("Heard on " + sources[a.id]) if a.id in sources else self._map_feed.get(a.id, "IPAWS"),
                 "expired": False, "status": a.status, "msg_type": a.msg_type,
@@ -414,6 +506,18 @@ class Endec:
         out.sort(key=lambda d: {"alert": 0, "watch": 1, "advisory": 2}.get(d["level"], 3))
         with self.map_lock:
             self.map_alerts, self.map_hidden = out, hidden
+
+    @staticmethod
+    def _with_note(a, info, heard):
+        """Message text for the map card: the alert's own, else text borrowed from the matching NWS / CAP alert."""
+        got = (info or {}).get("description", "").strip()
+        if not got:
+            return a.description
+        note = f"(Message text from {info.get('from', 'another source')}.)"
+        if heard:                                          # replace the 'only the header is known' placeholder
+            raw = a.description.rsplit("\n\n", 1)[-1]
+            return f"{got}\n\n{note}\nHeard on the audio source: {raw}"
+        return a.description if a.description.strip() else f"{got}\n\n{note}"
 
     def map_add_heard(self, hdr, raw, source):
         """An alert heard on an audio source goes on the map too (SAME header data only)."""
@@ -432,7 +536,7 @@ class Endec:
             while len(self._map_src) > 200:
                 del self._map_src[next(iter(self._map_src))]
             self._rebuild_map()
-            if hdr.org == "WXR" and hdr.eee not in self.MAP_EXCLUDE:
+            if hdr.org in ("WXR", "EAS") and hdr.eee not in self.TEST_CODES:     # stations relay NWS warnings too
                 threading.Thread(target=self._heard_lookup, args=(raw, hdr), daemon=True).start()
             if any(c[1:3] in self.SAME_MARINE for c in (str(f).zfill(6) for f in hdr.fips)):
                 threading.Thread(target=lambda: (self._resolve_zones(), self._rebuild_map()), daemon=True).start()
