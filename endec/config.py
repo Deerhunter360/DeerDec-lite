@@ -23,9 +23,26 @@ class Config:
     level_correct: bool = True            # even out loud/quiet speech
     level_target_db: int = -16            # target speech level (dBFS RMS)
     level_max_gain_db: int = 18           # never boost more than this
+    tone_level_match: bool = True         # headers + attention tone follow the voice level instead of being much louder
+    tone_boost_db: float = 2.0            # ...and sit this much above it
+    # Station: music folder played as program audio (cut for alerts) and streamed to Icecast
     map_port: int = 8765                  # local alert map: http://127.0.0.1:<port>/
     # --- SAME / audio
     callsign: str = "DEERDEC"
+    station_name: str = ""                # spoken station call name (EAN script); blank = the callsign
+    local_area_name: str = ""             # your EAS Local Area name, e.g. "Kanawha Valley"
+    local_fips: List[str] = field(default_factory=list)   # counties of your local area (SSCCC)
+    local_label: bool = True              # Discord: say LOCAL ALERT when an alert covers the local area
+    alert_filters: List[dict] = field(default_factory=list)   # [{name, enabled, events, orgs, where, label, action}]
+    attack_script_on: bool = True         # CDW (Civil Danger Warning) uses the attack-warning script below
+    attack_script_codes: str = "CDW"      # event codes that get the attack-warning script
+    attack_script: str = ("This is a Civil Danger Warning. Emergency officials have reported an attack, and your area is in danger. "
+                          "This is not a drill. Take shelter immediately in the nearest sturdy building. If you can, go to a basement "
+                          "or an interior room on the lowest floor, away from windows. Stay inside and do not travel. Do not use your "
+                          "telephone except to report a life-threatening emergency, so the lines stay open. Keep your radio or "
+                          "television tuned to this station for official instructions. Repeat: this is not a drill. Take shelter now.")
+    ean_repeat_seconds: int = 6           # EAN: pause between repeats of the station announcement
+    ean_attack_codes: str = "CDW,NUW,RHW"  # these alerts end the EAN wait (an attack warning)
     attn_seconds: int = 8
     out_dir: str = "alerts"
     easdata_path: str = "EASData.json"
@@ -52,6 +69,9 @@ class Config:
     use_cap_audio: bool = True         # use the audio inside the IPAWS alert when it has some
     cfg_version: int = 4
     cgen_seconds: int = 60
+    ean_max_minutes: int = 120            # longest a national emergency (EAN) may stay on air with no EOM heard
+    alert_gap_seconds: float = 2.0        # pause before a queued / recorded alert starts, so the ENDEC can breathe
+    screen_tail_seconds: int = 5          # screen stays this long after the alert audio ends
     cgen_style: str = "dasdec"         # see cgen.STYLES
     cgen_screen: int = -1              # monitor index (-1 = default)
     laptop_only: bool = False          # LAPTOP ONLY: alert + details screens in a window, not full screen

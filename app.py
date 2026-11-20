@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """DeerDec - EAS encoder / decoder / CGEN.   Run:  python app.py   (pip install -r requirements.txt)"""
+import html
 import os
 import queue
 import re
@@ -9,6 +10,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from PySide6.QtCore import Qt, QTimer
+from endec.widgets import CountyPicker, FilterTable
 from PySide6.QtGui import QFont, QGuiApplication, QKeySequence, QShortcut
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFormLayout, QGroupBox, QHBoxLayout,
                                QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox,
@@ -24,7 +26,7 @@ from endec.mapserver import MapServer
 from endec.ui_map import MapTab
 from endec.same import SameHeader
 from endec.ui_boot import BootScreen, Step
-from endec.ui_tabs import SourcesTab
+from endec.ui_tabs import AlertLogTab, SourcesTab
 
 ORG_ITEMS = [("EAS", "Broadcast station / cable system"), ("CIV", "Civil authorities"),
              ("WXR", "National Weather Service"), ("PEP", "Primary Entry Point")]
@@ -42,13 +44,16 @@ class MainWindow(QMainWindow):
         self.cfg = cfg
         self.engine = Endec(cfg)
         self.records, self.current_rec = [], None
+        self.ean_active, self._ean_tok, self._tok = False, 0, 0   # national emergency state
         self.pending, self.busy_until = [], 0.0       # alerts waiting their turn / when the current one ends
+        self.audio_until = 0.0                        # when the alert AUDIO ends (the audio switch resumes then, not at the end of the screen)
         self.screen_win = self._make_screen()
         self.details_win = None
         QTimer.singleShot(800, self._apply_details)
         self.listener = None
         if self.engine.monitor:
             self.engine.monitor.busy_cb = self._hold_live
+            self.engine.monitor.preempt_cb = self._preempt
         if self.engine.monitor:
             try:
                 from endec.listen import AudioListener
@@ -68,6 +73,8 @@ class MainWindow(QMainWindow):
         tabs = QTabWidget()
         tabs.addTab(self._monitor_tab(), "Monitor")
         QShortcut(QKeySequence("Ctrl+Shift+A"), self, activated=self._abort_alert)
+        self.log_tab = AlertLogTab(self.engine, self._show_entry, play_wav)
+        tabs.addTab(self.log_tab, "Alert Log")
         self.map_server, self.map_url = MapServer(self.engine, cfg.map_port), ""
         try:
             self.map_url = self.map_server.start()
@@ -202,7 +209,15 @@ class MainWindow(QMainWindow):
                 got = e._nws_cache().get(a.cap_id)
             except Exception:
                 got = None
+        if not got:                                        # waters (oceans, coastal waters, Great Lakes): the NWS zone outlines
+            try:
+                got = [ring for u in e._ugcs(a) for ring in e._zone_cache().get(u, [])]
+                if not got:
+                    e.ensure_zones(a)                      # not fetched yet (or it failed): fetch / retry in the background
+            except Exception:
+                got = []
         return got or []
+
 
     def _borrowed_text(self, rec):
         """Message text the engine borrowed from the matching NWS / CAP alert (for screens that show a message)."""
@@ -234,12 +249,17 @@ class MainWindow(QMainWindow):
 
 
 
+
+
     def _abort_alert(self):
         """Emergency stop: silence audio, drop the screen, empty the queue, discard any recording/live relay."""
         try:
             stop_audio()
+            self._tok = getattr(self, "_tok", 0) + 1
+            self.ean_active = False
+            self._ean_tok += 1
             self.pending.clear()
-            self.busy_until = 0.0
+            self.busy_until = self.audio_until = 0.0
             self.screen_win.close_timer.stop()
             self.screen_win.hide()
             if self.engine.monitor:
@@ -260,7 +280,111 @@ class MainWindow(QMainWindow):
         return bool(self._busy() or self.pending or self.engine.building
                     or (m is not None and m.relay_source is not None))
 
+    def _preempt(self, source):
+        """An EAN took over (called from the audio thread): stop what is on air; queued alerts wait and play after it."""
+        stop_audio()
+        self._tok = getattr(self, "_tok", 0) + 1
+        self._ean_tok += 1
+        self.ean_active = False
+        self.busy_until = self.audio_until = 0.0
+
+    # ---- National emergency (EAN): after the alert's own EOM, repeat the station announcement until an EAT
+    def _ean_cap(self):
+        return int(self.cfg.ean_max_minutes) * 60
+
+    def _attack_codes(self):
+        return {x.strip().upper() for x in str(self.cfg.ean_attack_codes).split(",") if x.strip()}
+
+    def _attack_begin(self, rec, delay=1.0):
+        """The attack warning has played: now it repeats (instead of the program audio coming back) until the EAT."""
+        if not self.ean_active:
+            return
+        self._ean_tok += 1
+        tok = self._ean_tok
+        self.busy_until = time.time() + self._ean_cap()
+        self.audio_until = time.time() + delay
+        text = " ".join(f"{rec.title}. {(rec.message or rec.text)}".split())
+        path, secs = self.engine.ean.wav_text(text, "attack")
+        if self.cfg.auto_cgen:
+            self._show(rec, self._ean_cap())
+        self._log(f"Attack warning repeats until the EAT (up to {self.cfg.ean_max_minutes} min)")
+        QTimer.singleShot(int(delay * 1000), lambda: self._attack_cycle(tok, time.time() + self._ean_cap(), path, secs, rec))
+
+    def _attack_cycle(self, tok, until, path, secs, rec):
+        if not self.ean_active or tok != self._ean_tok:
+            return
+        if time.time() > until:
+            self._log("National emergency: time limit reached - returning to normal")
+            self._ean_stop()
+            return
+        if path:
+            self.audio_until = time.time() + secs + 1.0
+            play_wav(path)
+        else:
+            secs = 5.0
+        QTimer.singleShot(int((secs + max(1, int(self.cfg.ean_repeat_seconds))) * 1000),
+                          lambda: self._attack_cycle(tok, until, path, secs, rec))
+
+    def _ean_begin(self, rec, delay):
+        """The EAN alert itself is over (its EOM has played): the program audio stays off, the screen stays up,
+        and the station announcement repeats until the EAT (or an attack warning, or the time limit)."""
+        self.ean_active = True
+        self._ean_tok += 1
+        tok = self._ean_tok
+        self.busy_until = time.time() + self._ean_cap()
+        self.audio_until = time.time() + delay
+        if self.cfg.auto_cgen:
+            self._show(rec, self._ean_cap())
+        self._log(f"National emergency: waiting for the EAT (announcement repeats, up to {self.cfg.ean_max_minutes} min)")
+        QTimer.singleShot(int(delay * 1000), lambda: self._ean_cycle(tok, time.time() + self._ean_cap()))
+
+    def _ean_cycle(self, tok, until):
+        if not self.ean_active or tok != self._ean_tok:
+            return
+        if time.time() > until:
+            self._log("National emergency: time limit reached - returning to normal")
+            self._ean_stop()
+            return
+        path, secs = self.engine.ean.wav("loop")
+        if path:
+            self.audio_until = time.time() + secs + 1.0
+            play_wav(path)
+        else:
+            secs = 5.0
+            self._log("National emergency: the voice is not available - screen only")
+        QTimer.singleShot(int((secs + max(1, int(self.cfg.ean_repeat_seconds))) * 1000),
+                          lambda: self._ean_cycle(tok, until))
+
+    def _ean_stop(self):
+        was = self.ean_active
+        self.ean_active = False
+        self._ean_tok += 1
+        if was:
+            stop_audio()
+        self.busy_until = self.audio_until = 0.0
+        win = self.screen_win                          # the national emergency is over: its screen (and ticker) goes too
+        if win.isVisible():
+            win.close_timer.stop()
+            win.hide()
+
     def _dispatch(self):
+        if self.ean_active:                              # national emergency: only the EAT can end it
+            for i, rec in enumerate(self.pending):
+                if rec.ready and rec.alert.eee in self._attack_codes():
+                    self.pending.pop(i)
+                    self._log(f"{rec.title} received during the national emergency - playing it, then repeating it")
+                    self._ean_tok += 1                       # the station announcement stops; the emergency stays on
+                    stop_audio()
+                    self._present(rec)
+                    return
+                if rec.ready and rec.alert.eee in ("EAT", "EAN"):
+                    self.pending.pop(i)
+                    self._log("EAT received - ending the national emergency" if rec.alert.eee == "EAT"
+                              else "Another EAN received - starting the national emergency sequence again")
+                    self._ean_stop()
+                    self._present(rec)
+                    return
+            return
         if self._busy():
             return
         for i, rec in enumerate(self.pending):
@@ -270,19 +394,73 @@ class MainWindow(QMainWindow):
                 return
 
     def _present(self, rec):
+        """One alert goes on air: a short pause first (the ENDEC gets a second or two to breathe), then the
+        screen and the audio (generated header x3, attention tone, message, EOM) start together."""
         try:
+            eee = rec.alert.eee
             if rec.from_audio and rec.mode == "live":
                 dur = self.cfg.relay_max_seconds + 10       # live audio is already playing; trimmed at the EOM
+                if eee == "EAN":                            # no fixed length: stays until its EOM / EAT (or the cap)
+                    dur = max(dur, self._ean_cap() + 10)
+                    self.ean_active = True
+                    self._ean_tok += 1
+                self.audio_until = time.time() + 2          # the live relay itself keeps the switch cut until it ends
+                self.busy_until = time.time() + dur
+                if self.cfg.auto_cgen:
+                    self._show(rec, dur)
+                return
+            gap = max(0.0, float(getattr(self.cfg, "alert_gap_seconds", 2.0)))
+            if rec.action == "discord only":                 # a filter says: Discord only, nothing here
+                self.busy_until = self.audio_until = 0.0
+                return
+            plays = bool(rec.wav and (rec.from_audio or self.cfg.auto_play) and rec.action != "silent")
+            dur = max(self.cfg.cgen_seconds, int(rec.seconds) + 2)
+            if plays:
+                dur = int(rec.seconds) + max(1, int(self.cfg.screen_tail_seconds))   # as long as the alert needs, plus a few seconds
+            if eee == "EAT" and rec.wav:                     # EAT audio + "This concludes operations..." twice, one wav
+                got = self.engine.ean.with_conclusion(rec.wav)
+                if got:
+                    rec.wav, rec.seconds = got
+                    plays = plays or rec.action != "silent"
+                    dur = int(rec.seconds) + max(1, int(self.cfg.screen_tail_seconds))
+            if eee == "EAN":
+                dur = max(dur, self._ean_cap())
+                self.ean_active = True
+                self._ean_tok += 1
+            self.audio_until = time.time() + gap + 1.0 if eee in ("EAN", "EAT") else 0.0   # music stays off through the pause
+            self.busy_until = time.time() + gap + dur       # program audio stays cut through the pause too
+            self._tok = getattr(self, "_tok", 0) + 1
+            tok = self._tok
+            loop_attack = self.ean_active and eee in self._attack_codes()
+            if loop_attack:
+                dur = max(dur, self._ean_cap())
+
+            def go():
+                if tok != self._tok:                        # aborted during the pause
+                    return
+                try:
+                    if plays:
+                        self._log(f"Playing {'recording' if rec.from_audio else 'alert audio'} ({rec.seconds:.0f}s)")
+                        self.audio_until = time.time() + rec.seconds + 1.0
+                        play_wav(rec.wav)
+                    if self.cfg.auto_cgen:
+                        self._show(rec, dur)
+                    if loop_attack:                         # attack warning during the emergency: repeat it after its EOM
+                        QTimer.singleShot(int(((rec.seconds if plays else 0) + 3.0) * 1000),
+                                          lambda tk=tok: tk == self._tok and self._attack_begin(rec, 1.0))
+                    if eee == "EAN" and plays:              # alert (not live) finished: now wait for the EAT
+                        QTimer.singleShot(int((rec.seconds + 3.0) * 1000),
+                                          lambda tk=tok: tk == self._tok and self._ean_begin(rec, 1.0))
+                except Exception as e:
+                    self.busy_until = self.audio_until = 0.0
+                    self._log(f"Could not present alert: {e}")
+            if gap > 0:
+                self._log(f"Next alert: {rec.title} - starting in {gap:.0f}s")
+                QTimer.singleShot(int(gap * 1000), go)
             else:
-                dur = max(self.cfg.cgen_seconds, int(rec.seconds) + 2)
-                if rec.wav and (rec.from_audio or self.cfg.auto_play) and rec.mode != "live":
-                    self._log(f"Playing {'recording' if rec.from_audio else 'alert audio'} ({rec.seconds:.0f}s)")
-                    play_wav(rec.wav)
-            self.busy_until = time.time() + dur
-            if self.cfg.auto_cgen:
-                self._show(rec, dur)
+                go()
         except Exception as e:
-            self.busy_until = 0.0
+            self.busy_until = self.audio_until = 0.0
             self._log(f"Could not present alert: {e}")
 
     def _volume(self, v):
@@ -324,7 +502,8 @@ class MainWindow(QMainWindow):
         ab.setToolTip("Stops the audio, closes the screen, clears the queue and discards a live/recorded alert (Ctrl+Shift+A)")
         ab.clicked.connect(self._abort_alert)
         row.addWidget(ab)
-        for text, fn in (("Stop alert audio", stop_audio), ("Refresh connections", self.engine.refresh),
+        for text, fn in (("Stop alert audio", stop_audio),
+                         ("Refresh connections", self.engine.refresh),
                          ("Replay IPAWS feed", self.engine.replay_feed),
                          ("Stop", self.engine.stop), ("Start", self.engine.start)):
             b = QPushButton(text)
@@ -365,7 +544,7 @@ class MainWindow(QMainWindow):
                  f" &nbsp; last poll {last} &nbsp; next in {nxt} &nbsp; "
                  f"{ip['alerts']} alerts in feed, {ip['new']} new &nbsp; ({ip['polls']} polls)"]
         if ip["error"]:
-            lines.append(f"&nbsp;&nbsp;&nbsp;<span style='color:#e74c3c'>{ip['error']}</span>")
+            lines.append(f"&nbsp;&nbsp;&nbsp;<span style='color:#e74c3c'>{html.escape(str(ip['error']))}</span>")
         n_listen = n_audio = 0
         m = e.monitor
         if m is None:
@@ -376,11 +555,11 @@ class MainWindow(QMainWindow):
             n_audio += 1
             ok = st.get("state") in AUDIO_OK
             n_listen += ok
-            c = "#2ecc71" if ok else "#f1c40f" if st.get("state", "").startswith(("Conn", "Start", "Recon")) else "#e74c3c"
+            c = "#2ecc71" if ok else "#f1c40f" if st.get("state", "").startswith(("Conn", "Start", "Recon")) else "#95a5a6"
             ear = " 🔊" if m.listen_name == name else ""
             last_h = (f" &nbsp; bursts heard: {st.get('bursts', 0)}"
-                      + (f" &nbsp; last header: {st['last']}" if st.get("last") else ""))
-            lines.append(f"<span style='color:{c}'>●</span> <b>{name}</b>{ear}: {st.get('state', '')}{last_h}")
+                      + (f" &nbsp; last header: {html.escape(str(st['last']))}" if st.get("last") else ""))
+            lines.append(f"<span style='color:{c}'>●</span> <b>{html.escape(str(name))}</b>{ear}: {html.escape(str(st.get('state', '')))}{last_h}")
         watch = "all locations"
         lines.append(f"<span style='color:#95a5a6'>Watching: {watch} &nbsp;|&nbsp; "
                      f"Style: {self.style_cb.currentText()} &nbsp;|&nbsp; Alerts this session: {len(self.records)}</span>")
@@ -401,11 +580,14 @@ class MainWindow(QMainWindow):
                     self._on_alert(data)
                 elif kind == "relay":
                     self._on_relay(*data)
+                elif kind == "logged":
+                    self.log_tab.reload()
         except queue.Empty:
             pass
 
     def _on_alert(self, rec):
         self.records.append(rec)
+        self.log_tab.reload()
         r = self.table.rowCount()
         self.table.insertRow(r)
         for c, val in enumerate((datetime.now().strftime("%H:%M:%S"), rec.alert.org, rec.alert.eee,
@@ -413,7 +595,7 @@ class MainWindow(QMainWindow):
             self.table.setItem(r, c, QTableWidgetItem(val))
         self._log(rec.header)
         self._log(rec.text)
-        if self._busy() or any(r for r in self.pending):
+        if rec.alert.eee != "EAN" and (self._busy() or any(r for r in self.pending)):
             self._log(f"Another alert is on air - {rec.title} queued ({len(self.pending) + 1} waiting)")
             if rec.from_audio and rec.mode == "live":
                 # This one was set to relay live but has to wait, so there is nothing live to join later.
@@ -421,18 +603,33 @@ class MainWindow(QMainWindow):
                 rec.mode = "record"
                 rec.ready = os.path.basename(rec.wav or "").startswith("heard_")      # True once the recording is finished
                 self._log(f"{rec.title}: will play from its recording when it is next")
-        self.pending.append(rec)
+        if rec.alert.eee == "EAN":
+            self.pending.insert(0, rec)                   # a national emergency goes ahead of anything waiting
+        else:
+            self.pending.append(rec)
         self._dispatch()
 
+    def _show_entry(self, entry):
+        """Alert Log -> 'Show on screen' (no audio, no Discord)."""
+        try:
+            _a, _h, rec = self.engine.rec_from_entry(entry)
+            self._show(rec)
+        except Exception as e:
+            self._log(f"Could not show that alert: {e}")
 
     def _on_relay(self, source, path, secs, rec):
         """Audio following a heard alert has finished recording."""
         self._log(f"Alert audio from {source}: {secs:.0f}s")
         if rec is None:
             return
+        if rec.mode == "live" and rec.alert.eee == "EAN" and self.ean_active:
+            self._ean_begin(rec, 7.0)             # after DeerDec's own EOM has played: the repeating announcement
+            self._dispatch()
+            return
         if rec.mode == "live":                    # live audio is over: keep the screen up a little longer
-            dur = max(self.cfg.cgen_seconds, 10)
+            dur = max(1, int(self.cfg.screen_tail_seconds)) + 2    # relay over: a few more seconds on screen, then audio back
             self.busy_until = time.time() + dur
+            self.audio_until = time.time() + 1.5
             if self.screen_win.isVisible():
                 self.screen_win.close_timer.start(int(dur * 1000))
         self._dispatch()
@@ -467,6 +664,16 @@ class MainWindow(QMainWindow):
             ("boot_screen", "bool", "Show the startup sequence", None, ""),
                         ("easdata_path", "text", "EASData.json path", None, "Event names and colors."),
         ]),
+        ("Local area", [
+            ("station_name", "text", "Station call name (spoken)", None,
+             "How the EAN announcement says your station. Blank = the callsign."),
+            ("local_area_name", "text", "EAS Local Area name", None, "e.g. Kanawha Valley - spoken in the EAN announcement."),
+            ("local_fips", "counties", "Counties in your local area", None, ""),
+            ("local_label", "bool", "Say LOCAL ALERT in Discord when an alert covers the local area", None, ""),
+        ]),
+        ("Alert filters", [
+            ("alert_filters", "filters", "Filters", None, ""),
+        ]),
         ("IPAWS", [
             ("feed_url", "text", "Feed URL", None, ""),
             ("poll_seconds", "int", "Poll every (seconds)", (5, 3600), ""),
@@ -484,6 +691,10 @@ class MainWindow(QMainWindow):
              "-16 is a good start. The tones and headers stay at their own fixed level."),
             ("level_max_gain_db", "int", "Never boost more than (dB)", (0, 30),
              "Stops a near-silent source from turning into loud hiss."),
+            ("tone_level_match", "bool", "Match headers / attention tone to the voice level", None,
+             "Keeps the SAME headers and attention tone from being much louder than the spoken alert."),
+            ("tone_boost_db", "float", "Tones are this much louder than the voice (dB)", (0.0, 8.0),
+             "2 = just slightly louder."),
             ("audio_output", "outdevice", "Speaker / output device", None,
              "Where alerts and the live relay play. Applies when you save."),
             ("attn_seconds", "int", "Attention tone length (seconds)", (3, 30), "For tones DeerDec generates."),
@@ -492,7 +703,11 @@ class MainWindow(QMainWindow):
         ]),
         ("Screen", [
             ("auto_cgen", "bool", "Show the alert screen automatically", None, ""),
-            ("cgen_seconds", "int", "Minimum time on screen (seconds)", (5, 900), ""),
+            ("cgen_seconds", "int", "Time on screen for an alert without audio (seconds)", (5, 900), ""),
+            ("alert_gap_seconds", "float", "Pause before each alert starts (seconds)", (0.0, 10.0),
+             "Gives the ENDEC a moment to breathe before the next alert's tones and audio. 0 = start right away."),
+            ("screen_tail_seconds", "int", "Keep the screen up after the alert audio ends (seconds)", (1, 120),
+             "The screen stays as long as the alert needs plus this, and then the program audio comes back."),
             ("cgen_page_seconds", "float", "Seconds per page (paged screens)", (2.0, 60.0), ""),
             ("laptop_only", "bool", "LAPTOP ONLY (show in a window, not full screen)", None,
              "For a single screen: the alert screen and Details Channel open as normal resizable windows. "
@@ -564,6 +779,13 @@ class MainWindow(QMainWindow):
                     elif kind == "lines":
                         w = QPlainTextEdit("\n".join(val))
                         w.setFixedHeight(80)
+                    elif kind == "para":
+                        w = QPlainTextEdit(str(val))
+                        w.setFixedHeight(150)
+                    elif kind == "counties":
+                        w = CountyPicker(val)
+                    elif kind == "filters":
+                        w = FilterTable(val)
                     elif kind == "outdevice":
                         w = QComboBox()
                         w.addItem(audio_out.DEFAULT_LABEL)
@@ -583,7 +805,7 @@ class MainWindow(QMainWindow):
                         w.setSingleStep(0.1)
                         w.setDecimals(2)
                         w.setValue(float(val))
-                    w.setMaximumWidth(460 if kind in ("text", "lines") else 220)
+                    w.setMaximumWidth(760 if kind in ("counties", "filters") else 560 if kind == "para" else 460 if kind in ("text", "lines") else 220)
                     cell, lab = w, label
                     if kind == "outdevice":
                         w.setMaximumWidth(380)
@@ -644,6 +866,10 @@ class MainWindow(QMainWindow):
             return w.text().strip()
         if kind == "lines":
             return [x.strip() for x in w.toPlainText().splitlines() if x.strip()]
+        if kind in ("counties", "filters"):
+            return w.get()
+        if kind == "para":
+            return " ".join(w.toPlainText().split())
         if kind == "outdevice":
             t = w.currentText()
             return "" if t == audio_out.DEFAULT_LABEL else t
@@ -659,6 +885,10 @@ class MainWindow(QMainWindow):
             w.setText(str(val))
         elif kind == "lines":
             w.setPlainText("\n".join(val))
+        elif kind in ("counties", "filters"):
+            w.set(val)
+        elif kind == "para":
+            w.setPlainText(str(val))
         elif kind in ("outdevice", "choice"):
             w.setCurrentText(str(val) if val else audio_out.DEFAULT_LABEL if kind == "outdevice" else str(val))
         else:
@@ -686,6 +916,10 @@ class MainWindow(QMainWindow):
                 w.setText(str(val))
             elif kind == "lines":
                 w.setPlainText("\n".join(val))
+            elif kind in ("counties", "filters"):
+                w.set(val)
+            elif kind == "para":
+                w.setPlainText(str(val))
             elif kind == "outdevice":
                 w.setCurrentText(str(val) if val else audio_out.DEFAULT_LABEL)
             elif kind == "choice":
@@ -700,6 +934,8 @@ class MainWindow(QMainWindow):
             for key in self.fields:
                 setattr(c, key, self._field_get(key))
             c.callsign = c.callsign[:8] or "DEERDEC"
+            if c.tts_enabled:
+                self.engine.ean.warm()                  # the EAN announcements use the station / area names
             audio_out.set_output(c.audio_output)
             if self.engine.monitor:
                 self.engine.monitor.flush_gen += 1      # reopen the live listener on the new output

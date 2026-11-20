@@ -8,6 +8,22 @@ DEFAULT_LABEL = "System default"
 _choice = ""            # saved device description ("" = system default)
 _sink = None
 _buf = None
+tap = None              # the Station (streamer.py), if running: it gets its own copy of every alert sound
+
+
+def tap_wav(path):
+    if tap:
+        tap.inject_wav(path)
+
+
+def tap_pcm(data, sr):
+    if tap:
+        tap.inject(data, sr, 1)
+
+
+def tap_stop():
+    if tap:
+        tap.flush_alert()
 
 
 def set_output(name: str):

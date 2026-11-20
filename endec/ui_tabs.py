@@ -225,3 +225,103 @@ class SourcesTab(QWidget):
         self._commit()
 
 
+class AlertLogTab(QWidget):
+    """Every alert DeerDec has handled (kept in alert_log.json). Pick one to see it, play it,
+    or send it again."""
+    COLS = ["Time", "Source", "Event", "Originator", "Level", "Areas"]
+
+    def __init__(self, engine, on_show, on_play, parent=None):
+        super().__init__(parent)
+        from PySide6.QtWidgets import QPlainTextEdit
+        self.engine, self.on_show, self.on_play = engine, on_show, on_play
+        self.rows = []
+        v = QVBoxLayout(self)
+        self.table = QTableWidget(0, len(self.COLS))
+        self.table.setHorizontalHeaderLabels(self.COLS)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
+        hh = self.table.horizontalHeader()
+        hh.setSectionResizeMode(QHeaderView.Interactive)
+        hh.setStretchLastSection(True)
+        for i, w in enumerate((150, 220, 220, 110, 80)):
+            self.table.setColumnWidth(i, w)
+        self.table.itemSelectionChanged.connect(self._detail)
+        v.addWidget(self.table, 3)
+        self.detail = QPlainTextEdit()
+        self.detail.setReadOnly(True)
+        self.detail.setMaximumHeight(150)
+        v.addWidget(self.detail, 1)
+        row = QHBoxLayout()
+        for text, fn in (("Show on screen", self._show), ("Play audio", self._play),
+                         ("Send old alert…", self._send), ("Refresh", self.reload)):
+            b = QPushButton(text)
+            b.clicked.connect(fn)
+            row.addWidget(b)
+        row.addStretch()
+        self.count = QLabel("")
+        row.addWidget(self.count)
+        v.addLayout(row)
+        self.reload()
+
+    def reload(self, *_):
+        sel = self._sel_entry()
+        self.rows = list(reversed(self.engine.alert_log))            # newest first
+        self.table.setRowCount(len(self.rows))
+        for r, e in enumerate(self.rows):
+            vals = (e["time"], (e.get("source") or "")[:80], e["title"], e["org"], e.get("level", ""),
+                    "; ".join(e.get("areas", []))[:200])
+            for c, val in enumerate(vals):
+                self.table.setItem(r, c, QTableWidgetItem(val))
+            if sel and e["id"] == sel["id"]:
+                self.table.selectRow(r)
+        self.count.setText(f"{len(self.rows)} logged")
+
+    def _sel_entry(self):
+        r = self.table.currentRow() if self.table.selectedItems() else -1
+        return self.rows[r] if 0 <= r < len(self.rows) else None
+
+    def _detail(self):
+        e = self._sel_entry()
+        if not e:
+            self.detail.setPlainText("")
+            return
+        wav = e.get("wav") or ""
+        have = "yes" if wav and __import__("os").path.exists(wav) else "no"
+        self.detail.setPlainText(f"{e['header']}\n\n{e['text']}\n" + (f"\nMessage: {e['message']}\n" if e.get("message") else "")
+                                 + f"\nSource: {e.get('source', '')}\nAudio saved: {have}")
+
+    def _need(self):
+        e = self._sel_entry()
+        if e is None:
+            QMessageBox.information(self, "Alert log", "Select an alert in the list first.")
+        return e
+
+    def _show(self):
+        e = self._need()
+        if e:
+            self.on_show(e)
+
+    def _play(self):
+        e = self._need()
+        if not e:
+            return
+        wav = e.get("wav") or ""
+        if wav and __import__("os").path.exists(wav):
+            self.on_play(wav)
+        else:
+            QMessageBox.information(self, "Alert log", "There is no saved audio for this alert. "
+                                    "'Send old alert' will generate it again.")
+
+    def _send(self):
+        e = self._need()
+        if not e:
+            return
+        ans = QMessageBox.question(
+            self, "Send old alert",
+            f"Are you sure you want to send this old alert?\n\n{e['title']}\nLogged {e['time']}\n\n"
+            "It will be shown on the alert screen and played.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if ans == QMessageBox.Yes:
+            self.engine.resend(e)

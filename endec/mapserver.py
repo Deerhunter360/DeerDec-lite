@@ -102,7 +102,10 @@ function countyIds(a) {
     const c = String(code).padStart(6, '0');
     if (c === '000000') continue;                       // whole nation: nothing sensible to shade
     const ss = c.slice(1, 3), ccc = c.slice(3);
-    if (ccc === '000') (byState[ss] || []).forEach(i => ids.add(i)); else ids.add(ss + ccc);
+    if (ccc === '000') (byState[ss] || []).forEach(i => ids.add(i));
+    else if (counties && !counties.has(ss + ccc) && byState[ss] && ['60','64','66','68','69','70','72','74','78'].includes(ss))
+      byState[ss].forEach(i => ids.add(i));             // an island district we only have as islands: shade them all
+    else ids.add(ss + ccc);
   }
   return ids;
 }
@@ -306,6 +309,26 @@ class MapServer:
             self.httpd.server_close()
 
     def _counties(self):
+        """County outlines plus the island territories, as one GeoJSON (cached in memory)."""
+        if getattr(self, "_merged", None) is None:
+            body = self._counties_file()
+            if body:
+                try:
+                    from .cgen import _terr_features
+                    gj = json.loads(body)
+                    have = {str(f.get("id")).zfill(5) for f in gj.get("features", [])}
+                    for k, ft in _terr_features(have).items():
+                        rings = [r + [r[0]] for r in ft["rings"]]
+                        gj["features"].append({"type": "Feature", "id": k, "properties": {},
+                                               "geometry": {"type": "MultiPolygon", "coordinates": [[r] for r in rings]}})
+                    body = json.dumps(gj, separators=(",", ":")).encode("utf-8")
+                except Exception as e:
+                    self.engine.log(f"Map: could not add the island territories: {e}")
+                self._merged = body
+            return body
+        return self._merged
+
+    def _counties_file(self):
         """County outlines (US Census, by FIPS) - downloaded once, then kept in data/."""
         if os.path.exists(self.counties_path) and os.path.getsize(self.counties_path) > 100000:
             return open(self.counties_path, "rb").read()

@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 from .cap import IpawsClient
+from . import local
 from .config import Config
 from .easdata import EasData
 from .models import Alert
@@ -48,6 +49,14 @@ class AlertRecord:
     mode: str = "off"                                # audio: off / record / live
     ready: bool = True                               # False until a record-mode recording has finished
     log_id: str = ""                                 # entry in the alert log
+    message_from: str = ""                           # where the message text came from, when borrowed (e.g. "IPAWS")
+    local: bool = False                              # covers the local area
+    label: str = ""                                  # LOCAL ALERT / a filter's own text (Discord)
+    action: str = "normal"                           # filter action: normal / ignore / silent / discord only / no discord
+
+
+def voice_has_cap_audio(text):
+    return text == "(audio supplied with the alert)"
 
 
 def fips_match(alert_codes, watch):
@@ -73,6 +82,10 @@ class Endec:
         self.events: "queue.Queue" = queue.Queue()
         self.encoder = AfskEncoder()
         self.tts = Tts()
+        from .ean import Ean
+        self.ean = Ean(self)
+        if cfg.tts_enabled:
+            self.ean.warm()                        # the national-emergency voices are made ahead of time
         self._stop = threading.Event()
         self._wake = threading.Event()             # set to poll IPAWS right now
         self._want_ipaws = self._want_audio = False
@@ -83,6 +96,9 @@ class Endec:
         self._zone_geo = None
         self._outline_info = {}                     # alert id -> text borrowed from the matching NWS / CAP alert
         self._outline_tried = set()                 # CAP alerts already being searched for an outline
+        self._zone_retry = {}                        # marine zone -> when to try fetching its outline again
+        self._zone_busy = False
+        self.frame_cb = None                         # set by the app: rec -> JPEG of the alert screen (Discord image)
         self._heard_poly = {}                        # heard-alert id -> polygon rings borrowed from NWS
         self._nws_geo = None
         self._map_src = {}                           # raw header -> (Alert, source name) heard on audio
@@ -326,18 +342,25 @@ class Endec:
                 self._zone_geo = {}
         return self._zone_geo
 
-    def _resolve_zones(self):
-        """Marine zones (waters) have no county outline: fetch their shapes from the NWS zone API, once each."""
+    ZONE_KINDS = ("coastal", "offshore", "marine", "forecast", "public")
+
+    def _resolve_zones(self, extra=()):
+        """Marine zones (waters) have no county outline: fetch their shapes from the NWS zone API.
+        A success is kept for good (data/zones.json); a failure is retried every few minutes, never stored."""
         geo = self._zone_cache()
+        for u in [u for u, r in geo.items() if not r]:        # empty entries from older versions: look again
+            del geo[u]
+        now = time.time()
         todo = []
-        for a in list(self._map_cache.values()) + [x for x, _s in self._map_src.values()]:
+        for a in list(self._map_cache.values()) + [x for x, _s in self._map_src.values()] + list(extra):
             for u in self._ugcs(a):
-                if len(u) == 6 and u[:2] in self.MARINE and u[2] == "Z" and u not in geo and u not in todo:
+                if (len(u) == 6 and u[:2] in self.MARINE and u[2] == "Z" and u not in geo and u not in todo
+                        and self._zone_retry.get(u, 0) <= now):
                     todo.append(u)
         changed = False
-        for u in todo[:12]:                                   # a few per poll
-            rings = None
-            for kind in ("coastal", "offshore", "marine", "forecast"):
+        for u in todo[:12]:                                   # a few per call
+            rings, why = [], "no shape in the NWS zone data"
+            for kind in self.ZONE_KINDS:
                 try:
                     req = urllib.request.Request(f"https://api.weather.gov/zones/{kind}/{u}",
                                                  headers={"User-Agent": "DeerDec/1.0", "Accept": "application/geo+json"})
@@ -346,26 +369,28 @@ class Endec:
                     polys = g.get("coordinates") or []
                     if g.get("type") == "Polygon":
                         polys = [polys]
-                    rings = []
+                    got = []
                     for poly in polys:
                         if poly:
                             ring = [[c[1], c[0]] for c in poly[0]]
                             step = max(1, len(ring) // 500)
-                            rings.append(ring[::step])
-                    break
+                            got.append(ring[::step])
+                    if got:
+                        rings = got
+                        break
                 except urllib.error.HTTPError as e:
-                    if e.code == 404:
-                        continue
+                    if e.code != 404:
+                        why = f"NWS answered HTTP {e.code}"
+                except Exception as e:
+                    why = f"could not reach NWS ({e})"
                     break
-                except Exception:
-                    break
-            if rings is not None:
+            if rings:
                 geo[u] = rings
                 changed = True
+                self.log(f"Map: got the outline of marine zone {u} ({len(rings)} shape(s))")
             else:
-                self.log(f"Map: could not get the outline of marine zone {u}")
-                geo[u] = []                                   # do not hammer the API for one that fails
-                changed = True
+                self._zone_retry[u] = now + 300               # try again in 5 minutes
+                self.log(f"Map: could not get the outline of marine zone {u} ({why}) - will retry")
         if changed:
             try:
                 os.makedirs("data", exist_ok=True)
@@ -373,6 +398,25 @@ class Endec:
                     json.dump(geo, f)
             except OSError:
                 pass
+
+    def ensure_zones(self, a):
+        """Called by the screen / Discord picture: make sure the water outlines for this alert are being fetched."""
+        try:
+            now = time.time()
+            urgent = [u for u in self._ugcs(a) if len(u) == 6 and u[:2] in self.MARINE
+                      and not self._zone_cache().get(u) and self._zone_retry.get(u, 0) <= now]
+        except Exception:
+            return
+        if urgent and not self._zone_busy:
+            self._zone_busy = True
+
+            def work():
+                try:
+                    self._resolve_zones([a])
+                    self._rebuild_map()
+                finally:
+                    self._zone_busy = False
+            threading.Thread(target=work, daemon=True).start()
 
     def _superseded(self, alerts):
         sup = set()
@@ -570,6 +614,22 @@ class Endec:
         except Exception:
             return []
 
+    def _ean_prepend_intro(self, path):
+        """'We interrupt our programming; this is a national emergency.' before the headers."""
+        try:
+            intro = self.ean.pcm("intro")
+            if intro is None:
+                return
+            with wave.open(path) as w:
+                prm, raw = w.getparams(), w.readframes(w.getnframes())
+            sr = prm.framerate
+            x = np.concatenate((intro, np.zeros(int(0.6 * sr), "<i2"), np.frombuffer(raw, "<i2")))
+            with wave.open(path, "wb") as w:
+                w.setparams(prm)
+                w.writeframes(x.tobytes())
+        except Exception as e:
+            self.log(f"EAN intro could not be added: {e}")
+
     def _log_alert(self, rec, a, source):
         from dataclasses import asdict
         entry = {"id": f"{time.time():.3f}", "time": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -600,6 +660,31 @@ class Endec:
         a = Alert(**{k: v for k, v in entry["alert"].items() if k in Alert.__dataclass_fields__})
         hdr = SameHeader.parse(entry["header"]) or SameHeader.from_alert(a, self.cfg.callsign)
         return a, hdr, self.preview_record(a, hdr)
+
+    def resend(self, entry):
+        """Show, play and post an old alert again (the caller has already asked 'are you sure?')."""
+        def work():
+            try:
+                a, hdr, rec = self.rec_from_entry(entry)
+                src = f"Re-sent old alert (first logged {entry['time']})"
+                wav = entry.get("wav")
+                if wav and os.path.exists(wav):
+                    rec.wav, rec.from_audio = wav, True          # from_audio: always plays
+                    try:
+                        with wave.open(wav) as w:
+                            rec.seconds = w.getnframes() / w.getframerate()
+                    except Exception:
+                        pass
+                    self._log_alert(rec, a, src)
+                    self.events.put(("alert", rec))
+                else:
+                    self.build(a, hdr, notify=True, source=src)
+                self.log(f"Re-sent old alert: {rec.title}")
+            except Exception as e:
+                self.log(f"Could not re-send the old alert: {e}")
+        threading.Thread(target=work, daemon=True).start()
+
+
 
 
 
@@ -705,13 +790,18 @@ class Endec:
         self._hdr_log = [h for h in self._hdr_log if now - h[3] < self.DUP_WINDOW_S]
         key = (hdr.eee, tuple(sorted(hdr.fips)), hdr.purge)
         for k, t, org, _ts in self._hdr_log:
-            if k == key and abs((t - issued).total_seconds()) <= self.DUP_ISSUE_MIN * 60:
+            window = 60 if hdr.eee in ("EAN", "EAT") else self.DUP_ISSUE_MIN * 60   # a second EAN / EAT soon after is a new one
+            if k == key and abs((t - issued).total_seconds()) <= window:
                 return org
         self._hdr_log.append((key, issued, origin, now))
         return None
 
     def process(self, a: Alert, notify=True, check_dup=True, feed="IPAWS") -> Optional[AlertRecord]:
         hdr = SameHeader.from_alert(a, self.cfg.callsign)
+        _l, act, names, _loc = local.match_filters(self.cfg, a.eee, a.org, a.fips)
+        if act == "ignore":
+            self.log(f"{feed}: {a.eee} ignored by filter '{', '.join(names)}'")
+            return None
         if check_dup:
             issued = self._parse_time(a.sent) or hdr.issued
             first = self._dup_of(hdr, issued, feed)
@@ -748,10 +838,19 @@ class Endec:
             self.log(f"Heard {hdr.eee} from {source} - outside watched locations")
             self._audio_recs.pop(source, None)
             return None
+        _l, act, names, _loc = local.match_filters(self.cfg, hdr.eee, hdr.org, hdr.fips)
+        if act == "ignore":
+            self.log(f"Heard {hdr.eee} on {source} - ignored by filter '{', '.join(names)}'")
+            self._audio_recs.pop(source, None)
+            return None
         a = Alert(id=f"audio-{raw}", status="Actual", eee=hdr.eee, org=hdr.org, fips=hdr.fips,
                   area=hdr.area_text(), sender_name=hdr.callsign, sent=hdr.issued.isoformat(),
                   expires=hdr.end_local().isoformat())
-        mode = self.monitor.decide_mode(source) if self.monitor else "off"
+        mode = self.monitor.decide_mode(source, hdr.eee) if self.monitor else "off"
+        if act == "silent" and mode == "live":
+            mode = "record"                                  # a filter says: show it, but do not play it
+        if self.monitor and hdr.eee == "EAN" and mode != "off":
+            self.monitor.preempt(source)
         if self.monitor:                                  # start the live gate NOW - building the alert takes a while
             self.monitor.accepted(source, mode)
         rec = self.build(a, hdr, notify=notify, tts=False, from_audio=True, mode=mode,
@@ -832,14 +931,36 @@ class Endec:
             voice_text = " ".join(" ".join(parts).replace("/", " ").split())
             voice = self.tts.synthesize(voice_text, self.encoder.sr, self.cfg.tts_rate,
                                         self.cfg.tts_voice, self.log)
+        codes = {x.strip().upper() for x in str(getattr(self.cfg, "attack_script_codes", "")).split(",") if x.strip()}
+        if (self.cfg.attack_script_on and a.eee in codes and not from_audio and not voice_has_cap_audio(voice_text)
+                and self.cfg.attack_script.strip() and self.cfg.tts_enabled):
+            v = self.tts.synthesize(self.cfg.attack_script, self.encoder.sr, self.cfg.tts_rate, self.cfg.tts_voice, self.log)
+            if v:
+                voice, voice_text = v, self.cfg.attack_script
+                rec.extra = [self.cfg.attack_script]
+                rec.message, rec.message_from = self.cfg.attack_script, "attack warning script"
+                self.log(f"{a.eee}: using the attack-warning script")
         if voice and self.cfg.level_correct:
             from .levels import normalize
             voice = normalize(np.asarray(voice, dtype=np.float64), self.encoder.sr,
                               self.cfg.level_target_db, self.cfg.level_max_gain_db).tolist()
         rec.wav = os.path.join(self.cfg.out_dir, f"{int(time.time())}_{a.eee}.wav")
         rec.voice_text, rec.from_audio, rec.mode = voice_text, from_audio, mode
+        rec.label, rec.action, _n, rec.local = local.match_filters(self.cfg, a.eee, a.org, a.fips)
         rec.ready = mode != "record"
+        from .levels import tone_rms
+        self.encoder.tone_rms = tone_rms(self.cfg)         # headers + attention tone sit just above the voice level
+        if a.eee == "EAN":                                 # the screens show the same words the voice reads
+            from .ean import MESSAGE, loop_text
+            rec.extra = [MESSAGE, loop_text(self.cfg)]
+            rec.message, rec.message_from = " ".join(rec.extra), "EAN script"
+        if a.eee == "EAN":                                 # the scripted national emergency: message after the tones
+            ev = self.ean.pcm("message")
+            if ev is not None:
+                voice = (ev.astype(np.float64) / 32768.0 / 0.8).tolist()
         self.encoder.render(rec.header, rec.wav, self.cfg.attn_seconds, voice)
+        if a.eee == "EAN":
+            self._ean_prepend_intro(rec.wav)
         try:
             with wave.open(rec.wav) as w:
                 rec.seconds = w.getnframes() / w.getframerate()

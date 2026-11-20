@@ -52,6 +52,7 @@ def configure(cfg):
                   seconds=cfg.cgen_seconds, screen=cfg.cgen_screen,
                   windowed=getattr(cfg, "laptop_only", False),
                   bulletin=getattr(cfg, "bulletin_station", "KDEER 12"),
+                  corner=getattr(cfg, "callsign", "") or "DEERDEC",
                   atari_scale=getattr(cfg, "atari_scale", 1.0))
     # Classic uses fonts/eas.ttf only; Digital uses the Luxi Mono files only.
     _style["custom"] = _register_font("eas.ttf")
@@ -64,27 +65,43 @@ def configure(cfg):
 
 
 def place_on_screen(widget):
-    """Full-screen on the chosen monitor (e.g. the projector)."""
-    if _style.get("windowed"):
-        # LAPTOP ONLY: an ordinary resizable window instead of full screen, so a single screen can be used to test
+    """Full-screen on the chosen monitor (e.g. the projector), or - LAPTOP ONLY - an ordinary resizable window.
+    Safe to call again whenever the monitor or the mode changes: the window is taken out of full screen first,
+    so it really moves to the other monitor and can be resized."""
+    windowed = bool(_style.get("windowed"))
+    if windowed:
         if not getattr(widget, "_win_mode", False):
+            was = widget.isVisible()
             widget._orig_flags = widget.windowFlags()
             widget.setWindowFlags(Qt.Window | Qt.WindowTitleHint | Qt.WindowSystemMenuHint |
                                   Qt.WindowMinMaxButtonsHint | Qt.WindowCloseButtonHint)
             widget.setWindowTitle("DeerDec - LAPTOP ONLY")
             widget._win_mode = True
+            widget.setMinimumSize(320, 180)
             widget.resize(960, 540)
-        widget.showNormal()
+            if was:
+                widget.hide()
+        if widget.isFullScreen() or widget.isMaximized():
+            widget.showNormal()
+        if not widget.isVisible():
+            widget.showNormal()
         return
     if getattr(widget, "_win_mode", False):
+        widget.hide()
         widget.setWindowFlags(widget._orig_flags)
+        widget.setMinimumSize(0, 0)
         widget._win_mode = False
     screens = QGuiApplication.screens()
     i = _style["screen"]
     if 0 <= i < len(screens):
-        widget.setScreen(screens[i])
-        widget.move(screens[i].geometry().topLeft())
-    widget.showFullScreen()
+        target = screens[i]
+        if widget.isFullScreen() and widget.screen() is not target:
+            widget.showNormal()                       # leave full screen first, or it stays on the old monitor
+        widget.setScreen(target)
+        widget.move(target.geometry().topLeft())
+        widget.resize(target.geometry().size())
+    if not widget.isVisible() or not widget.isFullScreen():     # a hidden window still remembers 'full screen'
+        widget.showFullScreen()
 
 
 def _switch_keys(widget, e):
@@ -414,6 +431,13 @@ class DetailsScreen(QWidget):
         self.setWindowFlags(Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.setStyleSheet("background-color: black;")
+
+    def resizeEvent(self, e):
+        self.update()                                 # repaint at the new size (resized / moved to another monitor)
+        super().resizeEvent(e)
+
+    def screenChanged(self, *_):
+        self.update()
 
     def paintEvent(self, _):
         p = QPainter(self)
@@ -1084,9 +1108,9 @@ class Psc902Screen(PaintScreen):
 BULLETIN = {"blue": (28, 52, 168), "plate": (82, 86, 92), "box": (214, 214, 210), "fg": (238, 238, 232),
             "ink": (30, 30, 34), "blink_on": 1000, "blink_off": 600,
             "event": {"alert": (238, 48, 40), "watch": (232, 190, 40), "advisory": (70, 190, 100),
-                      "national": (255, 40, 40)},
+                      "national": (255, 40, 40), "clear": (70, 190, 100)},
             "head": {"alert": "WEATHER BULLETIN", "watch": "WEATHER WATCH", "advisory": "WEATHER ADVISORY",
-                     "civil": "CIVIL ALERT", "national": "NATIONAL ALERT"},
+                     "civil": "CIVIL ALERT", "national": "NATIONAL ALERT", "clear": "ALL CLEAR"},
             # non-weather (civil) event codes get the CIVIL ALERT heading; EAN is the national alert
             "civil": {"CDW", "CEM", "CAE", "LEW", "LAE", "EVI", "HMW", "NUW", "RHW", "SPW", "TOE", "FRW", "ADR",
                       "NMN"}}
@@ -1095,6 +1119,8 @@ BULLETIN = {"blue": (28, 52, 168), "plate": (82, 86, 92), "box": (214, 214, 210)
 def _bulletin_kind(r):
     """Which heading/color a record gets: national (EAN), civil (non-weather), or its weather level."""
     code = (getattr(getattr(r, "alert", None), "eee", "") or "").upper()
+    if code == "EAT":
+        return "clear"
     if code == "EAN" or getattr(r, "is_national", False):
         return "national"
     if code in BULLETIN["civil"]:
@@ -1203,7 +1229,8 @@ def _deer_bg(p, W, H, accent=None, right="", national=False, ms=0):
     fam = ["Arial", "Liberation Sans", "Helvetica"]
     p.setFont(mkfont(fam, H * 0.05, True, spacing=130))
     p.setPen(QColor(*DEER["amber"]))
-    p.drawText(QRectF(W * 0.04, H * 0.025, W * 0.5, H * 0.075), Qt.AlignLeft | Qt.AlignVCenter, "DEERDEC")
+    p.drawText(QRectF(W * 0.04, H * 0.025, W * 0.5, H * 0.075), Qt.AlignLeft | Qt.AlignVCenter,
+               str(_style.get("corner") or "DEERDEC").upper())
     if right:
         p.setFont(mkfont(fam, H * 0.038, True))
         p.setPen(QColor(*DEER["dim"]))
@@ -1232,11 +1259,67 @@ _COUNTIES = {"data": None, "loading": False, "failed": False}
 CONUS = (-125.0, 24.0, -66.5, 49.6)          # lon0, lat0, lon1, lat1
 
 
+# Island outlines (rough, hand-simplified) for the places the county file does not cover: key = SAME state+county.
+_TERR_RAW = {
+    "66010": [[(144.63, 13.30), (144.64, 13.43), (144.70, 13.52), (144.80, 13.60), (144.86, 13.65), (144.95, 13.59),
+               (144.89, 13.50), (144.85, 13.43), (144.76, 13.35), (144.73, 13.24), (144.66, 13.24)]],            # Guam
+    "69100": [[(145.69, 15.12), (145.70, 15.24), (145.76, 15.28), (145.82, 15.20), (145.78, 15.12), (145.72, 15.10)]],  # Saipan
+    "69110": [[(145.60, 14.99), (145.62, 15.08), (145.66, 15.09), (145.65, 14.95), (145.61, 14.95)]],                 # Tinian
+    "69085": [[(145.12, 14.13), (145.14, 14.17), (145.22, 14.18), (145.27, 14.15), (145.18, 14.11)]],                 # Rota
+    "69120": [[(145.72, 18.14), (145.78, 18.17), (145.80, 18.09), (145.75, 18.05)],                                   # Northern Islands
+              [(145.67, 16.35), (145.70, 16.37), (145.71, 16.33)], [(145.84, 16.69), (145.87, 16.71), (145.88, 16.67)]],
+    "60010": [[(-170.84, -14.35), (-170.76, -14.27), (-170.65, -14.26), (-170.56, -14.29), (-170.62, -14.33),
+               (-170.72, -14.37), (-170.80, -14.38)]],                                                               # Tutuila (East)
+    "60020": [[(-169.53, -14.26), (-169.45, -14.25), (-169.46, -14.21), (-169.52, -14.22)],                          # Manu'a
+              [(-169.70, -14.18), (-169.60, -14.17), (-169.62, -14.19)]],
+    "78010": [[(-64.90, 17.72), (-64.85, 17.78), (-64.70, 17.80), (-64.57, 17.76), (-64.60, 17.70), (-64.80, 17.69)]],  # St. Croix
+    "78020": [[(-64.79, 18.34), (-64.74, 18.38), (-64.68, 18.36), (-64.70, 18.32), (-64.76, 18.31)]],                  # St. John
+    "78030": [[(-65.09, 18.34), (-65.00, 18.37), (-64.90, 18.36), (-64.85, 18.33), (-64.95, 18.31), (-65.05, 18.31)]],  # St. Thomas
+    "72000": [[(-67.27, 18.36), (-67.15, 18.50), (-66.5, 18.49), (-65.8, 18.45), (-65.22, 18.38), (-65.30, 18.20),
+               (-65.7, 18.0), (-66.2, 17.93), (-66.9, 17.95), (-67.2, 18.05)]],                                      # Puerto Rico (only if the file lacks it)
+}
+
+
+def _blob(cx, cy, r, n=9):
+    """A small rounded outline standing in for an island or atoll."""
+    return [(cx + r * math.cos(2 * math.pi * i / n), cy + r * math.sin(2 * math.pi * i / n)) for i in range(n)]
+
+
+# Pacific / minor outlying islands: shown as small marks at their real positions (too small to outline here).
+_ISLANDS = {
+    "68000": [(171.38, 7.09, .2), (171.62, 7.05, .15), (167.73, 8.85, .25), (162.35, 11.35, .2), (165.5, 11.6, .2),
+              (166.9, 11.2, .15), (169.85, 11.23, .12), (170.0, 9.45, .15), (169.6, 5.9, .15), (171.9, 6.1, .15),
+              (168.7, 7.3, .2), (169.3, 9.9, .15)],                                         # Marshall Islands
+    "64000": [(151.78, 7.42, .35), (158.22, 6.88, .16), (162.98, 5.32, .12), (138.12, 9.55, .14), (139.7, 10.0, .12),
+              (143.9, 7.35, .12), (154.95, 3.85, .1), (154.78, 1.1, .1)],                    # Micronesia (Chuuk, Pohnpei, Kosrae, Yap...)
+    "74000": [(-177.38, 28.2, .15), (166.65, 19.29, .12), (-169.52, 16.73, .1), (-176.48, 0.19, .08),
+              (-176.62, 0.81, .08), (-160.02, -0.37, .08), (-162.4, 6.38, .08), (-162.08, 5.88, .08)],  # US Minor Outlying Is.
+}
+_TERR_RAW.update({k: [_blob(*v) for v in vs] for k, vs in _ISLANDS.items()})
+_TERR_RAW["70000"] = [[(134.55, 7.38), (134.65, 7.40), (134.67, 7.70), (134.60, 7.73), (134.52, 7.56)],      # Palau: Babeldaob
+                      _blob(134.45, 7.30, .07), _blob(134.25, 7.0, .08), _blob(134.15, 6.9, .05),            # Koror, Peleliu, Angaur
+                      _blob(134.70, 8.08, .06), _blob(132.2, 5.33, .06), _blob(131.12, 3.0, .05)]            # Kayangel, Sonsorol, Tobi
+
+
+def _terr_features(have):
+    out = {}
+    for k, rings in _TERR_RAW.items():
+        if k == "72000" and any(h.startswith("72") for h in have):
+            continue
+        if k in have:
+            continue
+        pts = [q for r in rings for q in r]
+        out[k] = {"bbox": (min(q[0] for q in pts), min(q[1] for q in pts), max(q[0] for q in pts), max(q[1] for q in pts)),
+                  "rings": [list(r) for r in rings]}
+    return out
+
+
 def _load_counties():
     try:
         path = os.path.join("data", "counties.json")
         if not os.path.exists(path):
             _COUNTIES["failed"] = True
+            _COUNTIES["data"] = _terr_features({})           # no county file yet: the islands still work
             return
         with open(path, "r", encoding="utf-8") as fh:
             gj = json.load(fh)
@@ -1252,7 +1335,11 @@ def _load_counties():
                 continue
             xs, ys = [q[0] for q in pts], [q[1] for q in pts]
             fid = str(ft.get("id") or ft.get("properties", {}).get("GEO_ID", ""))[-5:].zfill(5)
+            if fid.startswith("02"):                         # Alaska: the Aleutians cross the date line - keep one piece
+                rings = [[(x - 360 if x > 0 else x, y) for x, y in r] for r in rings]
+                xs = [x - 360 if x > 0 else x for x in xs]
             out[fid] = {"bbox": (min(xs), min(ys), max(xs), max(ys)), "rings": rings}
+        out.update(_terr_features(set(out)))                 # Guam, Marianas, American Samoa, Virgin Islands, ...
         _COUNTIES["data"] = out
     except Exception:
         _COUNTIES["failed"] = True
@@ -1276,7 +1363,7 @@ def _deer_area(rec):
             polys = list(MAP_SHAPES(rec) or [])
         except Exception:
             polys = []
-    rings = [[(pt[1], pt[0]) for pt in r] for r in polys if r]
+    rings = [[(pt[1] - 360 if (pt[1] > 170 and pt[0] > 50) else pt[1], pt[0]) for pt in r] for r in polys if r]
     fips = [str(c).zfill(6) for c in (getattr(al, "fips", None) or [])]
     whole = (not fips and getattr(rec, "is_national", False)) or any(c[1:] == "00000" for c in fips)
     return rings, fips, whole
@@ -1292,16 +1379,32 @@ def _deer_map_pixmap(rec, w, h, col):
                 ids.update(k for k in data if k.startswith(c[1:3]))
             elif c[1:] in data:
                 ids.add(c[1:])
+            elif c[1:3] in ("60", "64", "66", "68", "69", "70", "72", "74", "78"):     # a territory district we only have as islands: show them all
+                ids.update(k for k in data if k.startswith(c[1:3]))
+    wrap = False                                    # places on both sides of the date line (Pacific): put them side by side
     if whole:
         view = CONUS
     elif rings:
         pts = [q for r in rings for q in r]
         view = (min(q[0] for q in pts), min(q[1] for q in pts), max(q[0] for q in pts), max(q[1] for q in pts))
+        wrap = view[2] - view[0] > 180
     elif ids:
         bb = [data[i]["bbox"] for i in ids]
         view = (min(b[0] for b in bb), min(b[1] for b in bb), max(b[2] for b in bb), max(b[3] for b in bb))
+        wrap = view[2] - view[0] > 180
     else:
         return None
+    if wrap:
+        def lx(x):
+            return x + 360 if x < 0 else x
+        if rings:
+            pts = [(lx(q[0]), q[1]) for r in rings for q in r]
+        else:
+            pts = [(lx(b[i]), b[j]) for i in (0, 2) for j in (1, 3) for b in (data[k]["bbox"] for k in ids)]
+        view = (min(q[0] for q in pts), min(q[1] for q in pts), max(q[0] for q in pts), max(q[1] for q in pts))
+    else:
+        def lx(x):
+            return x
     x0, y0, x1, y1 = view
     mid = math.radians((y0 + y1) / 2)
     kx = max(0.2, math.cos(mid))
@@ -1310,7 +1413,7 @@ def _deer_map_pixmap(rec, w, h, col):
     sc = min(w / (spx * 1.3), h / (spy * 1.3))
 
     def pt(q):
-        return QPointF(w / 2 + (q[0] - cx) * kx * sc, h / 2 - (q[1] - cy) * sc)
+        return QPointF(w / 2 + (lx(q[0]) - cx) * kx * sc, h / 2 - (q[1] - cy) * sc)
 
     pm = QPixmap(w, h)
     pm.fill(QColor(8, 22, 20))
@@ -1323,6 +1426,8 @@ def _deer_map_pixmap(rec, w, h, col):
         hl.setAlpha(120)
         for k, ft in data.items():
             b = ft["bbox"]
+            if wrap and b[2] < 0:
+                b = (b[0] + 360, b[1], b[2] + 360, b[3])
             if b[2] < vx0 or b[0] > vx1 or b[3] < vy0 or b[1] > vy1:
                 continue
             mark = whole or k in ids
@@ -1407,7 +1512,8 @@ class DeerDecScreen(PaintScreen):
         col = BULLETIN["event"].get(kind, BULLETIN["event"]["alert"])
         until = f"UNTIL {r.end_local.upper()}" if r.end_local else ""
         nat = kind == "national"
-        _deer_bg(p, W, H, col, "NATIONAL ALERT" if nat else until, nat, ms)
+        clear = kind == "clear"                                    # EAT: the national emergency is over
+        _deer_bg(p, W, H, col, "NATIONAL ALERT" if nat else "ALL CLEAR" if clear else until, nat, ms)
         fam = ["Arial", "Liberation Sans", "Helvetica"]
         if nat:
             col = (255, 255, 255)                                  # white on blood red reads loudest
@@ -1430,8 +1536,9 @@ class DeerDecScreen(PaintScreen):
                 p.setPen(QColor(*col))
                 p.drawText(QRectF(W * 0.04, y, lw, lh), Qt.AlignLeft | Qt.AlignVCenter, ln)
                 y += lh
-            if r.end_local or nat:
-                t = "UNTIL FURTHER NOTICE" if nat else f"IN EFFECT UNTIL {r.end_local.upper()}"
+            if r.end_local or nat or clear:
+                t = ("THE NATIONAL EMERGENCY HAS ENDED" if clear else
+                     "UNTIL FURTHER NOTICE" if nat else f"IN EFFECT UNTIL {r.end_local.upper()}")
                 tpx = H * 0.045
                 tf = QFontMetrics(mkfont(fam, tpx, True, spacing=105))
                 tpx *= min(1.0, lw / max(1, tf.horizontalAdvance(t)))

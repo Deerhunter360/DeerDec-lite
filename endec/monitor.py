@@ -257,28 +257,47 @@ def tone_onset(x, sr, need=3):
     return None
 
 
+def tone_end(x, sr, a0, max_s=45):
+    """Sample index where the attention signal that began at a0 stops (two quiet 0.2 s windows in a row)."""
+    win, pos, miss, tend = int(0.2 * sr), a0, 0, a0
+    while pos + win <= len(x):
+        if tone_hit(x[pos:pos + win], sr):
+            miss = 0
+        else:
+            if miss == 0:
+                tend = pos
+            miss += 1
+        pos += win
+        if miss >= 2:
+            return tend
+        if (pos - a0) / sr > max_s:
+            return pos
+    return tend if miss else pos
+
+
 def tone_present(x, sr):
     """True if int16/float samples contain an EAS attention signal for at least ~0.6 s."""
     return tone_onset(x, sr) is not None
 
 
-def make_attn(sr, seconds, org=""):
-    """Synthetic attention signal: 1050 Hz for the NWS (WXR), else the 853+960 Hz EAS two-tone."""
+def make_attn(sr, seconds, org="", rms=None):
+    """Synthetic attention signal: 1050 Hz for the NWS (WXR), else the 853+960 Hz EAS two-tone.
+    rms = the level to set it to (0-1, before the final 0.8 scale); None = the old full level."""
     t = np.arange(int(sr * seconds)) / sr
     if org == "WXR":
-        y = 0.5 * np.sin(2 * np.pi * 1050 * t)
+        y = (rms * np.sqrt(2) if rms else 0.5) * np.sin(2 * np.pi * 1050 * t)
     else:
-        y = 0.25 * (np.sin(2 * np.pi * 853 * t) + np.sin(2 * np.pi * 960 * t))
+        y = (rms if rms else 0.25) * (np.sin(2 * np.pi * 853 * t) + np.sin(2 * np.pi * 960 * t))
     f = int(0.02 * sr)
     y[:f] *= np.linspace(0, 1, f)
     y[-f:] *= np.linspace(1, 0, f)
     return (y * 32767).astype("<i2")
 
 
-def make_eom(sr, lead=0.5):
+def make_eom(sr, lead=0.5, rms=None):
     """Three NNNN bursts, one second apart, preceded by `lead` seconds of silence."""
     from .same import AfskEncoder
-    enc = AfskEncoder(int(sr))
+    enc = AfskEncoder(int(sr), rms / 0.8 if rms else None)        # these are scaled by 0.8 below
     burst = enc._afsk(b"\xAB" * 16 + b"NNNN")
     s = [0.0] * int(sr * lead)
     for _ in range(3):
@@ -286,16 +305,16 @@ def make_eom(sr, lead=0.5):
     return (np.clip(np.array(s), -1, 1) * 0.8 * 32767).astype("<i2")
 
 
-def make_header_block(sr, raw, seconds, org=""):
+def make_header_block(sr, raw, seconds, org="", rms=None):
     """Generated 'start of alert': the SAME header x3, then the attention tone."""
     from .same import AfskEncoder
-    enc = AfskEncoder(int(sr))
+    enc = AfskEncoder(int(sr), rms / 0.8 if rms else None)        # the header is scaled by 0.8 below
     burst = enc._afsk(b"\xAB" * 16 + raw.encode("ascii", "ignore"))
     s = [0.0] * int(sr * 0.3)
     for _ in range(3):
         s += burst + [0.0] * int(sr)
     head = (np.clip(np.array(s), -1, 1) * 0.8 * 32767).astype("<i2")
-    return np.concatenate((head, make_attn(sr, seconds, org), np.zeros(int(0.5 * sr), "<i2")))
+    return np.concatenate((head, make_attn(sr, seconds, org, rms), np.zeros(int(0.5 * sr), "<i2")))
 
 
 # ============================================================ runners
@@ -369,12 +388,32 @@ class _Runner(threading.Thread):
         if raw == "NNNN":
             self._eom()
         else:
+            if self._rec is not None and self._new_alert(raw):
+                self.manager.engine.log(f"Audio [{self.name_}]: a new alert follows - finishing the previous recording first")
+                if self._eom_gn is None:                      # the new header's first burst is not part of the old one
+                    self._eom_gn = self._gn + self._cur_len - int((self._burst_s + 1.0) * self._sr)
+                self._finish("next alert")
             self._begin()
             self._rec_bursts = getattr(self, "_rec_bursts", 0) + 1
             self._hdr_end = self._gn + self._cur_len       # about where this header burst ended
             self._burst_s = (16 + len(raw)) * 8 / BAUD     # how long one header burst lasts
             self._attn_done = False
             self.voter.add(raw)
+
+    def _max_s(self):
+        """Longest one recording / live relay may run.  A national emergency (EAN) has no fixed length - the President
+        speaks until it is terminated - so it gets a much longer cap."""
+        c = self.manager.cfg
+        if "-EAN-" in (self._raw_last or ""):
+            return max(c.relay_max_seconds, int(getattr(c, "ean_max_minutes", 120)) * 60)
+        return c.relay_max_seconds
+
+    def _new_alert(self, raw):
+        """A header heard while a recording is open: is it a different alert than the one being recorded?"""
+        if self._eom_seen:
+            return True                                       # the previous alert already ended
+        return bool(self._raw_last) and raw != self._raw_last and self._hdr_end is not None and \
+            (self._gn - self._hdr_end) > 8 * self._sr
 
     def _decoder(self, sr):
         return SameDemod(sr, self._burst)
@@ -404,7 +443,7 @@ class _Runner(threading.Thread):
         if self._rec is not None:
             self._rec.append(data)
             self._rec_n += len(data)
-            over = self._rec_n / 2 / sr > self.manager.cfg.relay_max_seconds
+            over = self._rec_n / 2 / sr > self._max_s()
             if over or (self._eom_t is not None and time.time() >= self._eom_t):
                 self._gn = after
                 self._finish("max length" if over else "EOM")
@@ -494,12 +533,25 @@ class _Runner(threading.Thread):
                     self._open_live(x[(self._tend if self._miss >= 2 else self._tpos):], sr)
                     return
 
+    def _block(self, sr):
+        """DeerDec's own start of alert: the header x3 + the attention tone, at the voice level (+ a little)."""
+        from .levels import tone_rms
+        secs = max(3, self.manager.cfg.attn_seconds)
+        trms = tone_rms(self.manager.cfg)
+        if self._raw_last:
+            return make_header_block(sr, self._raw_last, secs, self._org(), trms)
+        return np.concatenate((make_attn(sr, secs, self._org(), trms), np.zeros(int(0.5 * sr), "<i2")))
+
     def _gen_start(self, sr):
         """Live: play generated headers (3x) + attention tone first; the live audio queues up behind them."""
         try:
-            secs = max(3, self.manager.cfg.attn_seconds)
-            blk = make_header_block(sr, self._raw_last, secs, self._org()) if self._raw_last else \
-                np.concatenate((make_attn(sr, secs, self._org()), np.zeros(int(0.5 * sr), "<i2")))
+            blk = self._block(sr)
+            if "-EAN-" in (self._raw_last or ""):          # national emergency: spoken intro, tones, then the scripted message
+                ean = self.manager.engine.ean
+                intro, msg = ean.pcm("intro", sr), ean.pcm("message", sr)
+                parts = ([intro, np.zeros(int(0.6 * sr), "<i2")] if intro is not None else []) + [blk] + \
+                        ([msg, np.zeros(int(0.5 * sr), "<i2")] if msg is not None else [])
+                blk = np.concatenate(parts)
             self.manager.inject(sr, blk.tobytes())
         except Exception as e:
             self.manager.engine.log(f"Live: could not generate header/tone: {e}")
@@ -580,37 +632,38 @@ class _Runner(threading.Thread):
             cut = self._eom_gn - self._rec_base - int(0.40 * sr)
             if 0 < cut < len(pcm):
                 pcm = pcm[:cut]
-        eom = make_eom(sr)
-        nb = 0
+        from .levels import tone_rms
+        eom = make_eom(sr, rms=tone_rms(cfg))
         if self._hdr_end is not None and not live_was:
-            hh = max(0, self._hdr_end - self._rec_base)
+            # Cut the source's own header bursts and attention tone, keep only the message, then put DeerDec's own
+            # header x3 + attention tone in front of it.
+            h = max(0, self._hdr_end - self._rec_base)
             try:
-                nb = count_header_bursts(pcm[:hh + int(1.5 * sr)], sr)
+                log(f"Recording from {self.name_} contains {count_header_bursts(pcm[:h + int(1.5 * sr)], sr)} header burst(s)"
+                    f" - replacing them with generated ones")
             except Exception:
-                nb = 0
-            log(f"Recording from {self.name_} contains {nb} header burst(s)")
-        if 0 < nb < 3 and self._raw_last and not live_was:     # a burst was missed: put the missing ones back
-            from .same import AfskEncoder
-            miss = 3 - nb
-            b = AfskEncoder(sr)._afsk(b"\xAB" * 16 + self._raw_last.encode("ascii", "ignore"))
-            one = (np.clip(np.array(b + [0.0] * int(sr)), -1, 1) * 0.8 * 32767).astype("<i2")
-            pcm = np.concatenate((np.tile(one, miss), pcm))
-            if self._hdr_end is not None:
-                self._hdr_end += len(one) * miss
-                self._rec_base -= 0
-            log(f"Only {nb} header burst(s) were heard - added {miss} generated so the alert has 3")
-        if cfg.level_correct and len(pcm):
+                pass
+            h0 = min(len(pcm), h + int(0.2 * sr))
+            on = tone_onset(pcm[h0:h0 + int(5.0 * sr)], sr)
+            if on is not None:
+                a0 = h0 + on
+                start = tone_end(pcm, sr, a0)
+                log(f"Source attention tone found ({(start - a0) / sr:.1f}s) - cut, generated one used instead")
+            else:
+                start = min(len(pcm), h + int(1.0 * sr))
+                log(f"No attention tone heard in the recording from {self.name_} - generated one used")
+            body = pcm[start:]
+            loud = np.nonzero(np.abs(body.astype(np.int32)) > 600)[0]
+            if len(loud):                                     # no dead air before the message
+                body = body[max(0, int(loud[0]) - int(0.3 * sr)):]
+            if cfg.level_correct and len(body):
+                from .levels import normalize
+                body = normalize(body, sr, cfg.level_target_db, cfg.level_max_gain_db)
+            pcm = np.concatenate((self._block(sr), body))
+        elif cfg.level_correct and len(pcm):
             from .levels import normalize
-            pcm = normalize(pcm, sr, cfg.level_target_db, cfg.level_max_gain_db)
-        # a source that drops the attention tone gets a generated one, right after the header
-        if self._hdr_end is not None:
-            h = self._hdr_end - self._rec_base
-            if not tone_present(pcm[h + int(0.5 * sr): h + int(40 * sr)], sr):
-                secs = max(3, cfg.attn_seconds)
-                ins = min(len(pcm), h + int(1.0 * sr))
-                pcm = np.concatenate((pcm[:ins], make_attn(sr, secs, self._org()),
-                                      np.zeros(int(0.5 * sr), "<i2"), pcm[ins:]))
-                log(f"No attention tone in the recording from {self.name_} - generated one ({secs}s)")
+            pcm = normalize(pcm, sr, cfg.level_target_db, cfg.level_max_gain_db,
+                            cfg.tone_boost_db if cfg.tone_level_match else None)
         if live_was and self._live_ever:              # live: the EOM plays after whatever is still queued
             self.manager.inject(sr, eom.tobytes())
         self._live_open = self._live_ever = False
@@ -760,6 +813,7 @@ class MonitorManager:
         self.listen_q = queue.Queue(maxsize=300)      # (sample_rate, pcm bytes) for the GUI player
         self.relay_source = None                      # source being relayed live right now
         self.flush_gen = 0
+        self.preempt_cb = None                        # GUI: stop what is on air for an EAN
         self.busy_cb = None                           # GUI: True while an alert is on screen / playing
         self._stop = threading.Event()
         self._thread = None
@@ -778,11 +832,13 @@ class MonitorManager:
             except queue.Full:
                 pass
 
-    def decide_mode(self, source):
+    def decide_mode(self, source, eee=""):
         """off / record / live for the alert just confirmed on `source`."""
         r = self.runners.get(source)
         if r is None or r._rec is None or self.cfg.audio_relay == "off":
             return "off"
+        if eee == "EAN":
+            return "live"                             # a national emergency is never held back: it goes out as it happens
         if self.cfg.audio_relay == "live" and not (self.busy_cb and self.busy_cb()):
             return "live"
         return "record"
@@ -834,15 +890,28 @@ class MonitorManager:
                 self.engine.log(f"Alert handling failed: {e}")
         threading.Thread(target=go, daemon=True).start()
 
-    def abort(self):
+    def preempt(self, source):
+        """A national emergency (EAN) heard on `source` takes over: whatever is on air stops, other recordings are
+        dropped.  Alerts that were only waiting in the queue stay queued and play after it."""
+        self.engine.log(f"EMERGENCY ACTION NOTIFICATION heard on {source} - taking over now")
+        if self.preempt_cb:
+            try:
+                self.preempt_cb(source)
+            except Exception as e:
+                self.engine.log(f"EAN preempt problem: {e}")
+        self.abort(except_source=source, quiet=True)
+
+    def abort(self, except_source=None, quiet=False):
         """Throw away whatever alert is being recorded/relayed: nothing more is played from it."""
         for r in list(self.runners.values()):
+            if except_source is not None and r.name_ == except_source:
+                continue
             r._rec, r._eom_t, r._live, r._live_open, r._live_ever, r._ls = None, None, False, False, False, ""
             r._hold.clear()
             r._hold_n = 0
             r._ring.clear()
             r._ring_n = 0
-        if self.relay_source is not None:
+        if self.relay_source is not None and self.relay_source != except_source:
             self.relay_source = None
             self.listen_name = getattr(self, "_prev_listen", None)
         self.flush_gen += 1                           # the listener drops anything still buffered
@@ -851,7 +920,8 @@ class MonitorManager:
                 self.listen_q.get_nowait()
             except queue.Empty:
                 break
-        self.engine.log("Alert aborted - recording/relay discarded")
+        if not quiet:
+            self.engine.log("Alert aborted - recording/relay discarded")
 
     def restart_all(self):
         """Drop every connection; the loop below recreates them within ~2 s."""

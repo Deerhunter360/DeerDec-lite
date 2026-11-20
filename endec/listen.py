@@ -6,6 +6,9 @@ import time
 from PySide6.QtCore import QObject, QTimer
 
 
+from . import audio_out
+
+
 class AudioListener(QObject):
     def __init__(self, manager, parent=None):
         super().__init__(parent)
@@ -65,6 +68,7 @@ class AudioListener(QObject):
         try:
             while True:
                 sr, data = self.m.listen_q.get_nowait()
+                audio_out.tap_pcm(data, sr)                    # live relay audio also goes to the stream
                 if self.sr != sr or not self.sink:
                     self._open(sr)
                 self.pending += data

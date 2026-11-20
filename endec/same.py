@@ -221,8 +221,9 @@ class AfskEncoder:
     """Renders SAME headers + attention tone to a mono 16-bit WAV."""
     MARK, SPACE, BAUD = 2083.3333, 1562.5, 520.8333
 
-    def __init__(self, sample_rate: int = 44100):
+    def __init__(self, sample_rate: int = 44100, tone_rms=None):
         self.sr = sample_rate
+        self.tone_rms = tone_rms          # None = full-scale tones (old behaviour); else the RMS (0-1) they are set to
 
     def _afsk(self, data: bytes):
         out, phase, acc = [], 0.0, 0.0
@@ -237,14 +238,18 @@ class AfskEncoder:
                 for _ in range(n):
                     out.append(math.sin(phase))
                     phase += step
+        if self.tone_rms:
+            k = self.tone_rms * math.sqrt(2)            # a sine's RMS is amplitude / sqrt(2)
+            out = [v * k for v in out]
         return out
 
     def _silence(self, sec):
         return [0.0] * int(self.sr * sec)
 
     def _attn(self, sec):
-        return [0.5 * (math.sin(2 * math.pi * 853 * i / self.sr) +
-                       math.sin(2 * math.pi * 960 * i / self.sr))
+        k = self.tone_rms if self.tone_rms else 0.5       # the two-tone sum has an RMS of 1.0 x k
+        return [k * (math.sin(2 * math.pi * 853 * i / self.sr) +
+                     math.sin(2 * math.pi * 960 * i / self.sr))
                 for i in range(int(self.sr * sec))]
 
     def render(self, header: str, path: str, attn_sec: float = 8.0,

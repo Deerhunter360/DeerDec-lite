@@ -6,6 +6,7 @@ from . import audio_out
 
 
 def play_wav(path: str):
+    audio_out.tap_wav(path)                      # the stream gets the alert audio too
     # A chosen speaker goes through Qt; otherwise the plain system default is used.
     if audio_out.using_custom() and audio_out.play_wav_device(path):
         return
@@ -22,6 +23,7 @@ def play_wav(path: str):
 
 
 def stop_audio():
+    audio_out.tap_stop()
     audio_out.stop_device()
     if sys.platform.startswith("win"):
         import winsound
